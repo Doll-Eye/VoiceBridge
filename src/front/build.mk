@@ -1,0 +1,91 @@
+TOOL64 := /opt/homebrew/bin/x86_64-w64-mingw32
+TOOL32 := /opt/homebrew/bin/i686-w64-mingw32
+FRONT := src/front
+TEST := tests/front
+BUILD := build
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -MMD -MP
+CPPFLAGS := -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX
+GUI := -static -mwindows -municode
+RPC := -lrpcrt4 -ladvapi32 -luser32
+
+ifeq ($(SPEAKER),log)
+SPEAKER_SOURCES := $(FRONT)/log_speaker.cpp
+else ifeq ($(SPEAKER),sapi)
+ifeq ($(wildcard src/voice/LIBS.txt),)
+$(error The SAPI speaker requires src/voice/LIBS.txt)
+endif
+SPEAKER_SOURCES := $(wildcard src/voice/*.cpp)
+SPEAKER_LIBS_FILE := src/voice/LIBS.txt
+SPEAKER_LIBS := $(shell cat $(SPEAKER_LIBS_FILE))
+else
+$(error SPEAKER must be log or sapi)
+endif
+
+SERVER_SOURCES := $(filter-out $(FRONT)/log_speaker.cpp,$(wildcard $(FRONT)/*.cpp)) $(SPEAKER_SOURCES)
+SERVER_OBJECTS := $(patsubst src/%.cpp,$(BUILD)/x64/%.o,$(SERVER_SOURCES)) $(BUILD)/x64/controller_s.o $(BUILD)/x64/controller_c.o
+
+.PHONY: all tests FORCE
+all: $(BUILD)/VoiceBridge.exe
+
+$(BUILD)/speaker-mode: FORCE
+	@mkdir -p $(BUILD)
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(SPEAKER)" ]; then printf '%s\n' '$(SPEAKER)' > $@; fi
+
+$(BUILD)/VoiceBridge.exe: $(SERVER_OBJECTS) $(BUILD)/speaker-mode $(FRONT)/build.mk $(SPEAKER_LIBS_FILE)
+	$(TOOL64)-g++ $(GUI) -o $@ $(SERVER_OBJECTS) $(RPC) -lshell32 $(SPEAKER_LIBS)
+
+$(BUILD)/x64/front/ping.o: CXXFLAGS += -fno-exceptions -fno-reorder-blocks
+
+$(BUILD)/x64/%.o: src/%.cpp $(BUILD)/x64/controller.h $(FRONT)/build.mk
+	@mkdir -p $(@D)
+	$(TOOL64)-g++ $(CPPFLAGS) $(CXXFLAGS) -I$(BUILD)/x64 -c $< -o $@
+
+define controller
+$(BUILD)/$(1)/controller.h: $(FRONT)/controller.idl $(FRONT)/build.mk
+	@mkdir -p $$(@D)
+	$($(2))-widl -m$(3) -Oif --prefix-client=client_ -h -o $$@ $$<
+
+$(BUILD)/$(1)/controller_c.c: $(FRONT)/controller.idl $(FRONT)/build.mk
+	@mkdir -p $$(@D)
+	$($(2))-widl -m$(3) -Oif --prefix-client=client_ -c -o $$@ $$<
+
+$(BUILD)/$(1)/controller_s.c: $(FRONT)/controller.idl $(FRONT)/build.mk
+	@mkdir -p $$(@D)
+	$($(2))-widl -m$(3) -Oif -s -o $$@ $$<
+
+$(BUILD)/$(1)/controller_%.o: $(BUILD)/$(1)/controller_%.c $(BUILD)/$(1)/controller.h
+	$($(2))-gcc $(CPPFLAGS) -O2 -c $$< -o $$@
+endef
+$(eval $(call controller,x64,TOOL64,64))
+$(eval $(call controller,x86,TOOL32,32))
+
+$(BUILD)/stock.exe: $(TEST)/stock.cpp $(TEST)/test.h $(FRONT)/build.mk
+	$(TOOL64)-g++ $(CPPFLAGS) $(filter-out -MMD -MP,$(CXXFLAGS)) $(GUI) -o $@ $<
+
+PRISM := ../d4-assist-fork/templates/ue4ss-prism-bridge/libs/prism/include
+$(BUILD)/prism-client.exe: $(TEST)/prism.cpp $(TEST)/test.h $(PRISM)/prism.h $(FRONT)/build.mk
+	$(TOOL64)-g++ $(CPPFLAGS) $(filter-out -MMD -MP,$(CXXFLAGS)) $(GUI) -I$(PRISM) -o $@ $<
+
+tests: all $(BUILD)/stock.exe $(BUILD)/prism-client.exe
+
+-include $(SERVER_OBJECTS:.o=.d)
+
+TEST_FLAGS := $(CPPFLAGS) $(filter-out -MMD -MP,$(CXXFLAGS)) $(GUI)
+TEST_RPC := $(FRONT)/rpc_alloc.cpp $(FRONT)/endpoint.cpp
+CLIENT_DEPS := $(TEST)/client.cpp $(TEST)/test.h $(FRONT)/controller_rpc.h $(TEST_RPC) $(FRONT)/build.mk
+
+$(BUILD)/client64.exe: $(CLIENT_DEPS) $(BUILD)/x64/controller_c.o
+	$(TOOL64)-g++ $(TEST_FLAGS) -iquote $(FRONT) -I$(BUILD)/x64 -o $@ $< $(TEST_RPC) $(BUILD)/x64/controller_c.o $(RPC)
+
+$(BUILD)/client32.exe: $(CLIENT_DEPS) $(BUILD)/x86/controller_c.o
+	$(TOOL32)-g++ $(TEST_FLAGS) -iquote $(FRONT) -I$(BUILD)/x86 -o $@ $< $(TEST_RPC) $(BUILD)/x86/controller_c.o $(RPC)
+
+$(BUILD)/lifecycle.exe: $(TEST)/lifecycle.cpp $(TEST)/test.h $(FRONT)/controller_rpc.h $(FRONT)/handle.h $(FRONT)/build.mk \
+	$(BUILD)/x64/controller_c.o $(BUILD)/x64/controller_s.o \
+	$(addprefix $(BUILD)/x64/front/,rpc.o rpc_alloc.o endpoint.o ping.o)
+	$(TOOL64)-g++ $(TEST_FLAGS) -iquote $(FRONT) -o $@ $< $(filter %.o,$^) $(RPC)
+
+$(BUILD)/vb-fake-nvda.exe: $(TEST)/fake.cpp $(TEST)/test.h $(FRONT)/build.mk
+	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $<
+
+tests: $(BUILD)/client64.exe $(BUILD)/client32.exe $(BUILD)/lifecycle.exe $(BUILD)/vb-fake-nvda.exe

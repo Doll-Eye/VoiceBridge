@@ -1,0 +1,5 @@
+build/
+build-b/
+*.log
+.DS_Store
+notes/
