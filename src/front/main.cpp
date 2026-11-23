@@ -10,8 +10,8 @@
 namespace {
 using namespace vb;
 
-constexpr wchar_t WindowClass[] = L"wxWindowClassNR";
-constexpr wchar_t WindowTitle[] = L"NVDA";
+constexpr wchar_t WindowClass[] = L"VoiceBridge.ServerWindow";
+constexpr wchar_t WindowTitle[] = L"VoiceBridge";
 constexpr DWORD NvdaCheckMs = 500;
 
 [[noreturn]] void Finish(Log& log, UINT code) {
@@ -54,6 +54,49 @@ int Stop() {
     return 0;
 }
 
+// NVDA's ordinary, ease-of-access and restart paths all acquire this mutex
+// before registering RPC. Only create it while absent. Never wait for NVDA's
+// mutex or keep a handle to an existing one.
+DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) {
+    const auto desktop = DesktopName();
+    if (desktop.empty()) return ERROR_INVALID_NAME;
+    const auto name = L"Local\\NVDA_" + desktop;
+    auto server = StartServer(executable);
+    if (!server.process) {
+        log.Write(LogLevel::Error, L"Could not start server (" + std::to_wstring(GetLastError()) + L")");
+        return 1;
+    }
+    const auto gate = CreateNvdaStartupMutex(name);
+    DWORD code = 3;
+    bool requested = false;
+    if (gate && !HasOtherMutexHandle(gate.get()) && !Stopping(stop) &&
+        ResumeThread(server.thread.get()) != static_cast<DWORD>(-1)) {
+        const HANDLE waitFor[] = {server.process.get(), stop};
+        for (;;) {
+            const DWORD wait = WaitForMultipleObjects(2, waitFor, FALSE, 100);
+            if (wait == WAIT_OBJECT_0) break;
+            if (wait != WAIT_TIMEOUT || HasOtherMutexHandle(gate.get())) {
+                requested = true;
+                SetEvent(server.stop.get());
+                if (WaitForSingleObject(server.process.get(), 200) != WAIT_OBJECT_0) {
+                    TerminateProcess(server.process.get(), 1);
+                }
+                break;
+            }
+        }
+    } else {
+        // The worker is still suspended and has never owned an endpoint.
+        TerminateProcess(server.process.get(), code);
+    }
+    WaitForSingleObject(server.process.get(), INFINITE);
+    // Release on this thread, only after the worker's endpoint is gone.
+    if (gate) ReleaseMutex(gate.get());
+    if (!gate) log.Write(LogLevel::Info, L"Standing aside because the NVDA startup mutex is unavailable");
+    if (requested) log.Write(LogLevel::Info, L"Released the controller after a stop or NVDA startup request");
+    GetExitCodeProcess(server.process.get(), &code);
+    return code;
+}
+
 [[noreturn]] void Supervise(HANDLE stop, const Settings& settings,
                             const std::filesystem::path& executable, Log& log) {
     log.Write(LogLevel::Info, L"Started");
@@ -62,6 +105,7 @@ int Stop() {
     while (!Stopping(stop)) {
         const auto nvda = FindNvda(settings, executable);
         if (nvda.pid) {
+            backoff = 1000;
             if (waitingPid != nvda.pid) {
                 log.Write(LogLevel::Info, L"Waiting for NVDA process " + std::to_wstring(nvda.pid));
                 if (!nvda.handle) {
@@ -83,17 +127,14 @@ int Stop() {
         waitingPid = 0;
         if (Stopping(stop)) break;
         const auto started = GetTickCount64();
-        const auto server = StartServer(executable);
-        if (server) {
-            const DWORD wait = WaitForSingleObject(server.get(), INFINITE);
-            if (wait == WAIT_FAILED) Fail(log, L"Could not wait for the server", GetLastError());
-            DWORD code = 0;
-            GetExitCodeProcess(server.get(), &code);
-            log.Write(code != 0 && code != 3 ? LogLevel::Error : LogLevel::Info,
-                      L"Server process " + std::to_wstring(GetProcessId(server.get())) +
-                          L" exited with code " + std::to_wstring(code));
-        } else {
-            log.Write(LogLevel::Error, L"Could not start server (" + std::to_wstring(GetLastError()) + L")");
+        {
+            // Direct --serve and the supervisor share this one serving slot.
+            const Handle slot(CreateMutexW(nullptr, TRUE, ServerMutex));
+            if (slot && GetLastError() != ERROR_ALREADY_EXISTS) {
+                const auto code = RunServer(stop, executable, log);
+                log.Write(code != 0 && code != 3 ? LogLevel::Error : LogLevel::Info,
+                          L"Server exited with code " + std::to_wstring(code));
+            }
         }
         if (Stopping(stop)) break;
         if (GetTickCount64() - started >= 5000) {
@@ -109,7 +150,7 @@ int Stop() {
 }
 
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_CLOSE || message == WM_ENDSESSION) {
+    if (message == WM_CLOSE || (message == WM_ENDSESSION && wParam)) {
         PostQuitMessage(message);
         return 0;
     }
@@ -131,8 +172,6 @@ struct ServerStartup {
 
 DWORD WINAPI StartServing(void* state) {
     auto& startup = *static_cast<ServerStartup*>(state);
-    auto status = RegisterController(startup.endpoint);
-    if (status != RPC_S_OK) return status;
     try {
         auto speaker = CreateSpeaker(startup.config, startup.speakerLog);
         {
@@ -146,6 +185,8 @@ DWORD WINAPI StartServing(void* state) {
         if (speaker) {
             speaker->Shutdown();
         } else {
+            auto status = RegisterController(startup.endpoint);
+            if (status != RPC_S_OK) return status;
             startup.log.Write(LogLevel::Info, L"Serving " + startup.endpoint);
         }
     } catch (...) {
@@ -155,7 +196,7 @@ DWORD WINAPI StartServing(void* state) {
 }
 
 DWORD WINAPI ShutdownSpeaker(void* speaker) {
-    static_cast<ISpeaker*>(speaker)->Shutdown();
+    try { static_cast<ISpeaker*>(speaker)->Shutdown(); } catch (...) { return 1; }
     return 0;
 }
 
@@ -187,7 +228,7 @@ DWORD WINAPI ProbeController(void* endpoint) {
     if (const auto nvda = FindNvda(settings, executable); nvda.pid) {
         StandAside(log, L"NVDA process " + std::to_wstring(nvda.pid) + L" is running");
     }
-    if (FindWindowW(WindowClass, WindowTitle)) StandAside(log, L"the NVDA window already exists");
+    if (FindWindowW(L"wxWindowClassNR", L"NVDA")) StandAside(log, L"the NVDA window already exists");
     auto endpoint = EndpointName();
     if (endpoint.empty()) Fail(log, L"Could not obtain the desktop endpoint", ERROR_INVALID_NAME);
     const Handle probe(CreateThread(nullptr, 0, ProbeController, &endpoint, 0, nullptr));
@@ -217,10 +258,10 @@ DWORD WINAPI ProbeController(void* endpoint) {
     windowClass.lpfnWndProc = WindowProcedure;
     windowClass.hInstance = instance;
     windowClass.lpszClassName = WindowClass;
-    if (!RegisterClassW(&windowClass)) Fail(log, L"Could not register the NVDA window class", GetLastError());
+    if (!RegisterClassW(&windowClass)) Fail(log, L"Could not register the VoiceBridge window class", GetLastError());
     if (!CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WindowClass, WindowTitle, WS_POPUP,
                          0, 0, 0, 0, nullptr, nullptr, instance, nullptr)) {
-        Fail(log, L"Could not create the NVDA window", GetLastError());
+        Fail(log, L"Could not create the VoiceBridge window", GetLastError());
     }
 
     ServerStartup startup(endpoint, settings, log);
@@ -250,7 +291,9 @@ DWORD WINAPI ProbeController(void* endpoint) {
             DWORD status = ERROR_FUNCTION_FAILED;
             GetExitCodeThread(worker.get(), &status);
             worker.reset();
-            if (status == RPC_S_DUPLICATE_ENDPOINT) StandAside(log, L"the endpoint is already bound at " + endpoint);
+            if (status == RPC_S_DUPLICATE_ENDPOINT) {
+                StopServing(startup, L"standing aside because the endpoint is already bound at " + endpoint, 3);
+            }
             if (status != RPC_S_OK) {
                 log.Write(LogLevel::Error, L"Startup failed at " + endpoint + L" (" + std::to_wstring(status) + L")");
                 StopServing(startup, L"startup failed", 1);
@@ -275,26 +318,44 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!argv) return 1;
     const bool stopping = count == 2 && wcscmp(argv[1], L"--stop") == 0;
     const bool server = count == 2 && wcscmp(argv[1], L"--serve") == 0;
+    const bool worker = count == 3 && wcscmp(argv[1], L"--rpc-worker") == 0;
+    HANDLE workerStop = nullptr;
+    if (worker) {
+        wchar_t* end = nullptr;
+        workerStop = reinterpret_cast<HANDLE>(wcstoull(argv[2], &end, 10));
+        DWORD flags = 0;
+        if (*end || !GetHandleInformation(workerStop, &flags) || !(flags & HANDLE_FLAG_INHERIT)) {
+            LocalFree(argv);
+            return 2;
+        }
+    }
     LocalFree(argv);
     if (stopping) return Stop();
-    if (count != 1 && !server) return 2;
+    if (count != 1 && !server && !worker) return 2;
 
-    const Handle stop(CreateEventW(nullptr, TRUE, FALSE, StopEventName));
-    if (!stop) return 1;
-    const Handle role(CreateMutexW(nullptr, TRUE, server ? ServerMutex : SupervisorMutex));
-    const auto mutexError = GetLastError();
-    if (!role) return 1;
-    if (!server && mutexError == ERROR_ALREADY_EXISTS) return 0;
-    if (Stopping(stop.get())) return 0;
-
+    Handle stop;
+    Handle role;
+    bool roleExists = false;
+    if (!worker) {
+        stop.reset(CreateEventW(nullptr, TRUE, FALSE, StopEventName));
+        if (!stop) return 1;
+        role.reset(CreateMutexW(nullptr, TRUE, server ? ServerMutex : SupervisorMutex));
+        roleExists = GetLastError() == ERROR_ALREADY_EXISTS;
+        if (!role) return 1;
+        if ((!server && roleExists) || Stopping(stop.get())) return 0;
+    }
     const auto executable = ExecutablePath();
     if (executable.empty()) return 1;
     const auto directory = executable.parent_path();
     const auto settings = ReadSettings(directory);
-    Log log(directory, server ? L"server" : L"supervisor", settings.level);
+    if (worker) {
+        Log log(directory, L"server", settings.level);
+        Serve(instance, workerStop, settings, executable, log);
+    }
+    Log log(directory, server ? L"guard" : L"supervisor", settings.level);
     if (server) {
-        if (mutexError == ERROR_ALREADY_EXISTS) StandAside(log, L"a VoiceBridge server is already running");
-        Serve(instance, stop.get(), settings, executable, log);
+        if (roleExists) StandAside(log, L"a VoiceBridge server is already running");
+        Finish(log, RunServer(stop.get(), executable, log));
     }
     Supervise(stop.get(), settings, executable, log);
 }

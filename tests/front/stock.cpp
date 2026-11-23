@@ -1,5 +1,7 @@
 #include "test.h"
 
+#include <rpc.h>
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR args, int) {
     return Test("stock.txt", [&](FILE* result) {
         const auto dll = LoadLibraryW(L".\\nvdaControllerClient64.dll");
@@ -29,9 +31,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR args, int) {
             Require(speak(L"Café déjà vu 中文") == 0, "Unicode");
             Require(speak(std::wstring(4000, L'x').c_str()) == 0, "long");
             Require(speak(L"") == 0, "empty");
+            Require(speak(nullptr) == RPC_X_NULL_REF_POINTER, "null speech reference");
             Require(speak(L"<b>5 < 6 & 7") == 0, "literal markup");
             Require(cancel() == 0, "cancelSpeech");
             Require(braille(L"Braille is ignored") == 0, "brailleMessage");
+            Require(braille(nullptr) == RPC_X_NULL_REF_POINTER, "null braille reference");
         }
         FreeLibrary(dll);
     });

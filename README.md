@@ -10,13 +10,13 @@ Built by a blind developer and an AI.
 
 - Games and mods reach NVDA through its controller interface, a local RPC endpoint. NV Access's `nvdaControllerClient` DLL, Tolk and PRISM all use it.
 - While NVDA is not running, VoiceBridge answers on that endpoint and speaks the text itself through SAPI 5. The natural voices reach SAPI through [NaturalVoiceSAPIAdapter](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter).
-- When NVDA starts, VoiceBridge steps aside straight away, so NVDA starts normally and its controller works as before. VoiceBridge comes back when NVDA quits.
+- VoiceBridge coordinates handover through NVDA’s desktop startup mutex. When the NVDA launcher requests it, the supervisor waits for the bridge’s RPC process to exit and then releases the mutex. VoiceBridge comes back after NVDA quits.
 - No game or mod files are changed.
 - The voice follows Narrator's chosen voice and speed, read from Narrator's settings, so you change them in Narrator. Narrator does not need to be running. If that voice cannot be reached through SAPI, VoiceBridge uses Jenny, then the default voice.
 
 ## Status
 
-- **Done:** the controller front end. It serves NVDA's `NvdaController` and `NvdaController3` interfaces, steps aside for a real NVDA and comes back when NVDA quits. It passed silent tests on Windows 11 with NV Access's client DLL, PRISM 0.18.3, and 32-bit and 64-bit clients. A call takes about 15 microseconds, and an idle VoiceBridge uses under 50 milliseconds of processor time a minute.
+- **Done:** the controller front end. It serves NVDA's `NvdaController` and `NvdaController3` interfaces, steps aside for a real NVDA and comes back when NVDA quits. It has been tested silently on Windows 11 with NV Access's client DLL, PRISM 0.18.3, and 32-bit and 64-bit clients. The handover fixtures and performance measurements are described in the [front-end review](REVIEW-front.md).
 - **Being written:** the voice. The aims are to start speaking within about 30 milliseconds, to interrupt at once, to cut the silence natural voices put at the start of every phrase (about 110 milliseconds), and to keep recent phrases in memory.
 - **Not yet tried:** an installed trial with real games.
 
@@ -24,13 +24,9 @@ Built by a blind developer and an AI.
 
 ## What it works with
 
-Anything that finds NVDA through the controller interface, for example:
+The stock NVDA controller DLL and PRISM v0.18.3 discover the bridge over RPC. Programs that use these directly can send it speech.
 
-- games and mods using Tolk, when NV Access's `nvdaControllerClient64.dll` (or `nvdaControllerClient32.dll` for a 32-bit game) is beside them;
-- programs using PRISM;
-- programs that load NV Access's controller client DLL themselves.
-
-Programs that look for NVDA's window find VoiceBridge too, because it keeps a hidden window with the same class and title.
+Upstream Tolk also requires a window with NVDA’s exact class and title. Games using that version of Tolk need real NVDA for its NVDA back end. VoiceBridge uses a different window identity because the Windows sign-in launcher for NVDA exits when it sees that window. [Tolk’s detection code](https://github.com/dkager/tolk/blob/e5149f0cb6ef9b941673017e0e7b7c409e485fbe/src/ScreenReaderDriverNVDA.cpp#L54-L57) · [NVDA’s sign-in check](https://github.com/nvaccess/nvda/blob/b896c9c44c86206b212a2d02bfeca0b1b2e80944/source/nvda.pyw#L140-L175)
 
 ## Build
 

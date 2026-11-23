@@ -11,7 +11,8 @@ extern "C" RPC_STATUS RPC_ENTRY RpcServerRegisterIf3(
     RPC_IF_CALLBACK_FN*, void*);
 
 namespace {
-std::atomic<vb::ISpeaker*> activeSpeaker;
+std::atomic<vb::ISpeaker*> activeSpeaker{nullptr};
+constexpr size_t MaxSpeechUnits = 100000;
 }
 
 namespace vb {
@@ -48,24 +49,33 @@ RPC_STATUS RegisterController(const std::wstring& endpoint) {
 error_status_t __stdcall testIfRunning() { return ERROR_SUCCESS; }
 
 error_status_t __stdcall speakText(const wchar_t* text) {
-    if (auto* speaker = activeSpeaker.load(std::memory_order_acquire); speaker && text && *text) {
-        size_t length = wcsnlen(text, 100000);
-        // Keep a surrogate pair together at the truncation boundary.
-        if (length == 100000 && text[length - 1] >= 0xD800 && text[length - 1] <= 0xDBFF) {
-            --length;
-        }
-        try {
-            speaker->Speak(std::wstring(text, length));
-        } catch (const std::bad_alloc&) {
-            return ERROR_OUTOFMEMORY;
-        }
+    if (!text || !*text) return ERROR_SUCCESS;
+    auto* speaker = activeSpeaker.load(std::memory_order_acquire);
+    if (!speaker) return ERROR_NOT_READY;
+    size_t length = wcsnlen(text, MaxSpeechUnits);
+    // Keep a surrogate pair together at the truncation boundary.
+    if (length == MaxSpeechUnits && text[length - 1] >= 0xD800 && text[length - 1] <= 0xDBFF) {
+        --length;
+    }
+    try {
+        speaker->Speak(std::wstring(text, length));
+    } catch (const std::bad_alloc&) {
+        return ERROR_OUTOFMEMORY;
+    } catch (...) {
+        return ERROR_FUNCTION_FAILED;
     }
     return ERROR_SUCCESS;
 }
 
 error_status_t __stdcall cancelSpeech() {
     if (auto* speaker = activeSpeaker.load(std::memory_order_acquire)) {
-        speaker->Cancel();
+        try {
+            speaker->Cancel();
+        } catch (const std::bad_alloc&) {
+            return ERROR_OUTOFMEMORY;
+        } catch (...) {
+            return ERROR_FUNCTION_FAILED;
+        }
     }
     return ERROR_SUCCESS;
 }
@@ -73,7 +83,16 @@ error_status_t __stdcall cancelSpeech() {
 error_status_t __stdcall brailleMessage(const wchar_t*) { return ERROR_SUCCESS; }
 
 error_status_t __stdcall isSpeaking(boolean* speaking) {
-    auto* speaker = activeSpeaker.load(std::memory_order_acquire);
-    *speaking = speaker && speaker->IsSpeaking();
+    if (!speaking) return ERROR_INVALID_PARAMETER;
+    *speaking = FALSE;
+    if (auto* speaker = activeSpeaker.load(std::memory_order_acquire)) {
+        try {
+            *speaking = speaker->IsSpeaking();
+        } catch (const std::bad_alloc&) {
+            return ERROR_OUTOFMEMORY;
+        } catch (...) {
+            return ERROR_FUNCTION_FAILED;
+        }
+    }
     return ERROR_SUCCESS;
 }

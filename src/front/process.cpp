@@ -1,5 +1,6 @@
 #include "process.h"
 
+#include <sddl.h>
 #include <tlhelp32.h>
 #include <winternl.h>
 
@@ -118,14 +119,80 @@ NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& exec
     return match;
 }
 
-Handle StartServer(const std::filesystem::path& executable) {
-    auto command = L"\"" + executable.wstring() + L"\" --serve";
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
+Handle CreateNvdaStartupMutex(const std::wstring& name) {
+    // CreateMutexW in NVDA requests full access. Preserve access for this
+    // user at ordinary integrity even if VoiceBridge was started elevated.
+    HANDLE rawToken;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) return {};
+    const Handle token(rawToken);
+    DWORD size = 0;
+    GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
+    std::vector<BYTE> user(size);
+    if (!GetTokenInformation(token.get(), TokenUser, user.data(), size, &size)) return {};
+    wchar_t* sid = nullptr;
+    if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) return {};
+    auto sddl = std::wstring(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;") + sid + L")S:(ML;;NW;;;ME)";
+    LocalFree(sid);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                              &descriptor, nullptr)) return {};
+    SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
+    Handle mutex(CreateMutexW(&security, TRUE, name.c_str()));
+    const bool existed = GetLastError() == ERROR_ALREADY_EXISTS;
+    LocalFree(descriptor);
+    if (existed) return {};
+    return mutex;
+}
+
+bool HasOtherMutexHandle(HANDLE mutex) {
+    using Query = decltype(&NtQueryObject);
+    static const auto query = reinterpret_cast<Query>(reinterpret_cast<uintptr_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
+    PUBLIC_OBJECT_BASIC_INFORMATION info{};
+    // NVDA opens the existing mutex before it waits on it. Yield on a query
+    // failure too: serving must never depend on guessing a launcher's image.
+    return !query || query(mutex, ObjectBasicInformation, &info, sizeof(info), nullptr) < 0 ||
+           info.HandleCount != 1;
+}
+
+ServerProcess StartServer(const std::filesystem::path& executable) {
+    ServerProcess server;
+    server.job.reset(CreateJobObjectW(nullptr, nullptr));
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!server.job || !SetInformationJobObject(server.job.get(), JobObjectExtendedLimitInformation,
+                                                &limits, sizeof(limits))) return {};
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    server.stop.reset(CreateEventW(&inherit, TRUE, FALSE, nullptr));
+    if (!server.stop) return {};
+    HANDLE event = server.stop.get(), job = server.job.get();
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &size);
+    std::vector<BYTE> buffer(size);
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 2, 0, &size)) return {};
     PROCESS_INFORMATION child{};
-    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-                        nullptr, nullptr, &startup, &child)) return {};
-    CloseHandle(child.hThread);
-    return Handle(child.hProcess);
+    auto command = L"\"" + executable.wstring() + L"\" --rpc-worker " +
+                   std::to_wstring(reinterpret_cast<uintptr_t>(event));
+    // Job membership is atomic with creation. Even a crashing supervisor
+    // cannot leave an orphan with the controller endpoint.
+    bool started = UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                             &job, sizeof(job), nullptr, nullptr) &&
+                   UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                             &event, sizeof(event), nullptr, nullptr) &&
+                   CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+                                  CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                                  nullptr, nullptr, &startup.StartupInfo, &child);
+    auto error = GetLastError();
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
+    if (!started) {
+        SetLastError(error);
+        return {};
+    }
+    server.process.reset(child.hProcess);
+    server.thread.reset(child.hThread);
+    return server;
 }
 }

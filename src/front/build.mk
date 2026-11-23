@@ -89,3 +89,14 @@ $(BUILD)/vb-fake-nvda.exe: $(TEST)/fake.cpp $(TEST)/test.h $(FRONT)/build.mk
 	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $<
 
 tests: $(BUILD)/client64.exe $(BUILD)/client32.exe $(BUILD)/lifecycle.exe $(BUILD)/vb-fake-nvda.exe
+
+ifeq ($(SPEAKER),log)
+# Silent fault injection uses the production front and a stalled test speaker.
+$(BUILD)/stuck-bridge.exe: $(TEST)/stuck-speaker.cpp $(filter-out $(BUILD)/x64/front/log_speaker.o,$(SERVER_OBJECTS)) $(FRONT)/build.mk
+	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^) $(RPC) -lshell32
+
+$(BUILD)/settings-test.exe: $(TEST)/settings-test.cpp $(TEST)/test.h $(BUILD)/x64/front/settings.o $(FRONT)/build.mk
+	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^)
+
+tests: $(BUILD)/stuck-bridge.exe $(BUILD)/settings-test.exe
+endif
