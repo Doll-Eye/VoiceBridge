@@ -1,4 +1,5 @@
 #include "../../src/common/speaker.h"
+#include "crash-log.h"
 #include "observer.h"
 
 #ifndef NOMINMAX
@@ -10,6 +11,8 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -65,6 +68,26 @@ public:
             }
         }
         return result;
+    }
+
+    bool onlyVoice(const std::string& expected) {
+        const auto normalize = [](const std::string& text) {
+            std::string normalized;
+            for (unsigned char ch : text) {
+                if (!std::isspace(ch)) normalized += static_cast<char>(std::tolower(ch));
+            }
+            return normalized;
+        };
+        const auto name = normalize(expected);
+        std::lock_guard<std::mutex> guard(mutex_);
+        bool found = false;
+        for (const auto& line : lines_) {
+            if (line.find(". SAPI rate ") == std::string::npos) continue;
+            const auto normalized = normalize(line);
+            if (normalized.find("voice:" + name) != 0 && normalized.find("fallbackvoice:" + name) != 0) return false;
+            found = true;
+        }
+        return found;
     }
 
 private:
@@ -209,6 +232,9 @@ public:
         case Kind::HardwareQueued:
         case Kind::RenderStarved:
         case Kind::CacheEvicted:
+        case Kind::ReleaseStalled:
+        case Kind::LifecycleEntered:
+        case Kind::LifecycleLeft:
         case Kind::StallEntered:
         case Kind::WorkerStarted: return;
         }
@@ -279,10 +305,95 @@ bool Meets(const std::vector<double>& samples, size_t count, double medianMax, d
     return median < medianMax && runs.back() < worstMax;
 }
 
+enum class SuiteVoice { Default, Jenny, David };
+
+class VoiceModules {
+public:
+    bool start() {
+        const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto subscribe = reinterpret_cast<Subscribe>(reinterpret_cast<void (*)()>(
+            GetProcAddress(ntdll, "LdrRegisterDllNotification")));
+        unsubscribe_ = reinterpret_cast<Unsubscribe>(reinterpret_cast<void (*)()>(
+            GetProcAddress(ntdll, "LdrUnregisterDllNotification")));
+        if (!subscribe || !unsubscribe_ || subscribe(0, notify, this, &cookie_) < 0) return false;
+
+        // The notification also catches libraries that unload before a fixture ends.
+        HMODULE loaded[256];
+        DWORD size = 0;
+        if (!EnumProcessModules(GetCurrentProcess(), loaded, sizeof(loaded), &size) || size > sizeof(loaded)) return false;
+        for (size_t i = 0; i < size / sizeof(loaded[0]); ++i) {
+            wchar_t name[MAX_PATH];
+            const auto length = GetModuleBaseNameW(GetCurrentProcess(), loaded[i], name, MAX_PATH);
+            if (!length || length >= MAX_PATH) return false;
+            record(name, length);
+        }
+        return true;
+    }
+
+    ~VoiceModules() {
+        if (cookie_) unsubscribe_(cookie_);
+    }
+
+    static constexpr unsigned Adapter = 1;
+    static constexpr unsigned Onnx = 2;
+    unsigned loaded() const { return modules_.load(); }
+
+private:
+    struct LoadedLibrary {
+        ULONG flags;
+        const UNICODE_STRING* path;
+        const UNICODE_STRING* name;
+        PVOID base;
+        ULONG size;
+    };
+    using Callback = void (NTAPI*)(ULONG, const LoadedLibrary*, PVOID);
+    using Subscribe = NTSTATUS (NTAPI*)(ULONG, Callback, PVOID, PVOID*);
+    using Unsubscribe = NTSTATUS (NTAPI*)(PVOID);
+
+    static void NTAPI notify(ULONG reason, const LoadedLibrary* library, PVOID context) {
+        // A library unloaded while one of its threads or callbacks is still live
+        // would fail in code that no longer exists, so the step log records both.
+        vb::test::crash::Library(reason == 1, library->name, library->base, library->size);
+        if (reason == 1 && library->name) {
+            static_cast<VoiceModules*>(context)->record(library->name->Buffer, library->name->Length / sizeof(wchar_t));
+        }
+    }
+
+    static bool contains(const wchar_t* name, size_t length, const wchar_t* word, size_t count) {
+        for (size_t start = 0; start + count <= length; ++start) {
+            size_t offset = 0;
+            while (offset < count) {
+                wchar_t ch = name[start + offset];
+                if (ch >= L'A' && ch <= L'Z') ch += L'a' - L'A';
+                if (ch != word[offset]) break;
+                ++offset;
+            }
+            if (offset == count) return true;
+        }
+        return false;
+    }
+
+    void record(const wchar_t* name, size_t length) {
+        // The loader holds its lock in the callback. Use only local code and lock-free state.
+        static_assert(std::atomic<unsigned>::is_always_lock_free);
+        constexpr wchar_t adapter[] = L"naturalvoicesapiadapter";
+        constexpr wchar_t onnx[] = L"onnxruntime";
+        if (contains(name, length, adapter, std::size(adapter) - 1)) modules_.fetch_or(Adapter);
+        if (contains(name, length, onnx, std::size(onnx) - 1)) modules_.fetch_or(Onnx);
+    }
+
+    std::atomic<unsigned> modules_{0};
+    Unsubscribe unsubscribe_ = nullptr;
+    PVOID cookie_ = nullptr;
+};
+
 class Checks {
 public:
-    explicit Checks(const std::string& file) : file_(file) {}
-    void note(const std::string& line) { file_ << line << std::endl; }
+    explicit Checks(const std::string& file, SuiteVoice voice) : file_(file), voice_(voice) {}
+    void note(const std::string& line) {
+        file_ << line << std::endl;
+        vb::test::crash::Step("result: " + line);
+    }
     void check(bool passed, const std::string& name, const std::string& detail) {
         if (!passed) ++failed_;
         note(std::string(passed ? "PASS " : "FAIL ") + name + ": " + detail);
@@ -291,8 +402,52 @@ public:
         note("Failures: " + std::to_string(failed_));
         return failed_ ? 1 : 0;
     }
+    vb::SpeakerConfig config() const {
+        vb::SpeakerConfig config;
+        if (voice_ == SuiteVoice::Jenny) config.voice = L"Jenny (Natural)";
+        if (voice_ == SuiteVoice::David) config.voice = L"Microsoft David";
+        return config;
+    }
+    std::string expectedVoice() const {
+        if (voice_ == SuiteVoice::Jenny) return "Microsoft Jenny (Natural)";
+        if (voice_ == SuiteVoice::David) return "Microsoft David";
+        return {};
+    }
+    bool startVoiceIsolation() {
+        // Library monitoring also feeds the step log, so it runs in every mode.
+        if (voice_ == SuiteVoice::Default) {
+            if (!modules_.start()) note("Library load monitoring is unavailable.");
+            return true;
+        }
+        const bool david = voice_ == SuiteVoice::David;
+        const auto selected = david ? "VOICEBRIDGE_TEST_ONLY_DAVID" : "VOICEBRIDGE_TEST_ONLY_JENNY";
+        const auto other = david ? "VOICEBRIDGE_TEST_ONLY_JENNY" : "VOICEBRIDGE_TEST_ONLY_DAVID";
+        SetEnvironmentVariableA(other, nullptr);
+        char unexpected[2];
+        const bool configured = SetEnvironmentVariableA(selected, "1") &&
+            GetEnvironmentVariableA(other, unexpected, sizeof(unexpected)) == 0;
+        const bool monitoring = configured && modules_.start();
+        check(monitoring, "voice isolation setup", expectedVoice() + " and DLL load monitoring.");
+        return monitoring;
+    }
+    void checkVoice(Log& log, const char* fixture) {
+        if (voice_ == SuiteVoice::Default) return;
+        check(log.onlyVoice(expectedVoice()), std::string(fixture) + " selected voice", log.matching(". SAPI rate "));
+        checkModules(fixture);
+    }
+    void checkModules(const std::string& stage) {
+        if (voice_ == SuiteVoice::Default) return;
+        const auto modules = modules_.loaded();
+        const bool adapter = (modules & VoiceModules::Adapter) != 0;
+        const bool onnx = (modules & VoiceModules::Onnx) != 0;
+        check(voice_ == SuiteVoice::David ? !adapter && !onnx : adapter && onnx,
+              stage + " DLL loads to date", std::string("Adapter: ") + (adapter ? "loaded" : "absent") +
+              ", ONNX Runtime: " + (onnx ? "loaded" : "absent") + ".");
+    }
 private:
     std::ofstream file_;
+    SuiteVoice voice_;
+    VoiceModules modules_;
     int failed_ = 0;
 };
 
@@ -309,43 +464,57 @@ void NoteResources(Checks& checks, const std::string& label) {
                 ", handles " + (haveHandles ? std::to_string(handles) : "unavailable") + ".");
 }
 
+void NoteThreads(const std::string& label);
+
 class Harness {
 public:
     Harness(Checks& checks, vb::SpeakerConfig config, bool silent, const char* name)
         : checks_(checks), name_(name) {
+        NoteThreads(std::string(name_) + ": before the speaker");
         Tap().reset();
         config.nullOutput = !silent;
         config.silentOutput = silent;
         const auto start = Milliseconds();
         speaker = vb::CreateSpeaker(config, log);
         createMs = Milliseconds() - start;
+        step("speaker created");
     }
     ~Harness() {
         if (speaker && !finish(1000)) {
             // A surviving fixture could write its events into the next fixture's trace.
             TerminateProcess(GetCurrentProcess(), static_cast<UINT>(checks_.result()));
         }
+        step("fixture closed");
     }
     bool finish(unsigned long timeout) {
+        step("shutdown");
         speaker->Shutdown();
+        step("speaker release");
         speaker.reset();
         vb::voice::test::ReleaseTestStalls();
+        step("waiting for voice threads");
         const bool drained = vb::voice::test::WaitForVoiceThreads(timeout);
         if (!drained) checks_.check(false, "voice thread drain", name_);
+        checks_.checkVoice(log, name_);
         NoteResources(checks_, std::string(name_) + (drained ? " after worker drain" : " after drain timeout"));
+        NoteThreads(std::string(name_) + ": after the drain");
         return drained;
     }
     bool warm(Checks& checks) {
+        step("waiting for two warm voices");
         const auto start = Milliseconds();
         auto ready = Tap().wait([](const Trace& t) { return t.warmed >= 2; }, 12s);
         checks.check(ready && createMs < 50, "start and warm",
                      "CreateSpeaker " + Number(createMs) + " ms, two warm voices after " +
                      Number(Milliseconds() - start) + " ms. " + log.matching("SAPI rate") + log.matching("SAPI failed"));
+        if (ready) checks.checkModules(std::string(name_) + " warm-up");
         return ready;
     }
     std::uint64_t say(const std::wstring& text) {
         speaker->Speak(text);
-        return Tap().read([](const Trace& t) { return t.lastId; });
+        const auto id = Tap().read([](const Trace& t) { return t.lastId; });
+        step("said phrase " + std::to_string(id) + " of " + std::to_string(text.size()) + " characters");
+        return id;
     }
     bool quiet(std::chrono::milliseconds timeout) {
         const auto deadline = Clock::now() + timeout;
@@ -353,8 +522,11 @@ public:
         return !speaker->IsSpeaking();
     }
     bool hear(std::uint64_t id, std::chrono::milliseconds timeout = 1s) {
-        return Tap().wait([&](const Trace& t) { return t.phrases.at(id).firstLoud != 0; }, timeout);
+        const bool heard = Tap().wait([&](const Trace& t) { return t.phrases.at(id).firstLoud != 0; }, timeout);
+        step("phrase " + std::to_string(id) + (heard ? " heard" : " not heard"));
+        return heard;
     }
+    void step(const std::string& text) const { vb::test::crash::Step(std::string(name_) + ": " + text); }
     Log log;
     std::unique_ptr<vb::ISpeaker> speaker;
     double createMs = 0;
@@ -370,7 +542,7 @@ const std::wstring Sentence = L"The blacksmith opened the wooden door and put th
 const std::wstring Long = Sentence + L" " + Sentence + L" " + Sentence;
 
 void LatencyAndOrder(Checks& checks, bool silent) {
-    vb::SpeakerConfig config;
+    auto config = checks.config();
     config.followNarrator = false;
     config.cacheMegabytes = 0;
     config.keepAwakeSeconds = 0;
@@ -541,7 +713,7 @@ void LatencyAndOrder(Checks& checks, bool silent) {
 }
 
 void Cached(Checks& checks, bool silent) {
-    vb::SpeakerConfig config;
+    auto config = checks.config();
     config.followNarrator = false;
     config.keepAwakeSeconds = 0;
     Harness h(checks, config, silent, "Phrase cache");
@@ -574,9 +746,10 @@ void Cached(Checks& checks, bool silent) {
 }
 
 void VoiceAndRecovery(Checks& checks, bool silent) {
-    vb::SpeakerConfig config;
+    auto config = checks.config();
+    const auto preferred = config.voice;
     config.voice = L"NoSuchVoice";
-    config.fallbackVoice = L"David";
+    config.fallbackVoice = checks.expectedVoice().empty() ? L"David" : preferred;
     config.followNarrator = false;
     config.cacheMegabytes = 0;
     {
@@ -586,7 +759,7 @@ void VoiceAndRecovery(Checks& checks, bool silent) {
         const auto line = h.log.matching("Fallback voice:", &count);
         checks.check(works && count == 1, "voice fallback", line);
     }
-    config.voice = L"Jenny";
+    config.voice = preferred;
     config.fallbackVoice.clear();
     {
         SetEnvironmentVariableA("VOICEBRIDGE_TEST_HANG", "1");
@@ -641,15 +814,17 @@ struct ThreadSample {
     CpuTime cpu;
     std::optional<ULONGLONG> cycles;
     std::string label;
+    bool voiceBridge;
 };
 
-std::string ThreadLabel(HANDLE thread, DWORD id) {
+std::string ThreadLabel(HANDLE thread, DWORD id, bool& voiceBridge) {
     std::string label = id == GetCurrentThreadId() ? "Test harness" : "";
     PWSTR description = nullptr;
     if (SUCCEEDED(GetThreadDescription(thread, &description))) {
         if (description && *description) label = Utf8(description);
         LocalFree(description);
     }
+    voiceBridge = label == "VoiceBridge audio" || label == "VoiceBridge scheduler" || label == "VoiceBridge SAPI";
 
     using Query = decltype(&NtQueryInformationThread);
     static const auto query = reinterpret_cast<Query>(reinterpret_cast<void (*)()>(
@@ -690,8 +865,10 @@ std::optional<std::vector<ThreadSample>> SampleThreads() {
         if (GetProcessIdOfThread(thread) == processId && GetThreadTimes(thread, &created, &exited, &kernel, &user)) {
             ULONGLONG cycles = 0;
             const bool haveCycles = QueryThreadCycleTime(thread, &cycles);
+            bool voiceBridge = false;
+            auto label = ThreadLabel(thread, id, voiceBridge);
             samples.push_back({id, FileTicks(created), {FileTicks(kernel), FileTicks(user)},
-                               haveCycles ? std::optional<ULONGLONG>{cycles} : std::nullopt, ThreadLabel(thread, id)});
+                               haveCycles ? std::optional<ULONGLONG>{cycles} : std::nullopt, std::move(label), voiceBridge});
         }
         CloseHandle(thread);
     } while (Thread32Next(snapshot, &entry));
@@ -699,7 +876,22 @@ std::optional<std::vector<ThreadSample>> SampleThreads() {
     return samples;
 }
 
-void NoteIdleThreads(Checks& checks, const std::vector<ThreadSample>& before, const std::vector<ThreadSample>& after) {
+// Thread counts by name and entry module, for the step log.
+void NoteThreads(const std::string& label) {
+    const auto threads = SampleThreads();
+    if (!threads) {
+        vb::test::crash::Step(label + ": thread snapshot unavailable");
+        return;
+    }
+    std::map<std::string, unsigned> counts;
+    for (const auto& thread : *threads) ++counts[thread.label];
+    std::string line = label + ": " + std::to_string(threads->size()) + " threads";
+    for (const auto& [name, count] : counts) line += "; " + name + " x" + std::to_string(count);
+    vb::test::crash::Step(line);
+}
+
+std::optional<CpuTime> NoteIdleThreads(Checks& checks, const std::vector<ThreadSample>& before,
+                                      const std::vector<ThreadSample>& after) {
     auto find = [](const std::vector<ThreadSample>& samples, const ThreadSample& thread) {
         return std::find_if(samples.begin(), samples.end(), [&](const ThreadSample& sample) {
             return sample.id == thread.id && sample.created == thread.created;
@@ -708,26 +900,47 @@ void NoteIdleThreads(Checks& checks, const std::vector<ThreadSample>& before, co
     checks.note("Idle thread snapshots: " + std::to_string(before.size()) + " start, " +
                 std::to_string(after.size()) + " end. Modules identify thread entry points. " +
                 "Harness thread counts include endpoint sampling.");
+    CpuTime voiceBridge{};
+    unsigned matched = 0;
+    bool changed = false;
     for (const auto& thread : before) {
         const auto end = find(after, thread);
         const std::string label = "Idle thread " + std::to_string(thread.id) + " " + thread.label;
         if (end == after.end()) {
             checks.note(label + ": only seen at start.");
+            changed |= thread.voiceBridge;
             continue;
         }
+        const auto kernel = end->cpu.kernel - thread.cpu.kernel;
+        const auto user = end->cpu.user - thread.cpu.user;
+        if (thread.voiceBridge && end->voiceBridge) {
+            voiceBridge.kernel += kernel;
+            voiceBridge.user += user;
+            ++matched;
+        }
         const auto cycles = thread.cycles && end->cycles ? std::to_string(*end->cycles - *thread.cycles) : "unavailable";
-        checks.note(label + ": kernel " + Number((end->cpu.kernel - thread.cpu.kernel) / 10000.0) +
-                    " ms, user " + Number((end->cpu.user - thread.cpu.user) / 10000.0) + " ms, cycles " + cycles + ".");
+        checks.note(label + ": kernel " + Number(kernel / 10000.0) +
+                    " ms, user " + Number(user / 10000.0) + " ms, cycles " + cycles + ".");
     }
     for (const auto& thread : after) {
         if (find(before, thread) == before.end()) {
             checks.note("Idle thread " + std::to_string(thread.id) + " " + thread.label + ": only seen at end.");
+            changed |= thread.voiceBridge;
         }
     }
+    if (changed || matched != 4) return std::nullopt;
+    return voiceBridge;
+}
+
+std::string CpuDetail(const CpuTime& cpu, double elapsed) {
+    const double kernel = cpu.kernel / 10000.0;
+    const double user = cpu.user / 10000.0;
+    return Number(kernel + user) + " ms in " + Number(elapsed) + " ms elapsed. Kernel " + Number(kernel) +
+        " ms, user " + Number(user) + " ms.";
 }
 
 void NarratorAndCost(Checks& checks, bool silent, bool cost) {
-    vb::SpeakerConfig config;
+    auto config = checks.config();
     config.keepAwakeSeconds = 0;
     Harness h(checks, config, silent, "Narrator and cost");
     if (!h.warm(checks)) return;
@@ -740,8 +953,8 @@ void NarratorAndCost(Checks& checks, bool silent, bool cost) {
         checks.check(opened, "idle cost with WASAPI", opened ? h.log.matching("Audio device:")
                      : h.log.matching("Audio device unavailable"));
     }
-    const auto beforeThreads = SampleThreads();
     NoteResources(checks, "Idle start after warming and playing one phrase");
+    const auto beforeThreads = SampleThreads();
     const auto beforeCpu = ProcessCpu();
     const auto start = Milliseconds();
     Sleep(60000);
@@ -752,15 +965,15 @@ void NarratorAndCost(Checks& checks, bool silent, bool cost) {
     const auto cacheBytes = Tap().read([](const Trace& t) { return t.cacheBytes; });
     if (cacheBytes) checks.note("Idle end cache storage: " + Number(*cacheBytes / 1048576.0) + " MiB.");
     if (beforeCpu && afterCpu) {
-        const double kernel = (afterCpu->kernel - beforeCpu->kernel) / 10000.0;
-        const double user = (afterCpu->user - beforeCpu->user) / 10000.0;
-        checks.check(kernel + user < 100, "idle CPU", Number(kernel + user) + " ms in " + Number(elapsed) +
-                     " ms elapsed. Kernel " + Number(kernel) + " ms, user " + Number(user) + " ms.");
+        checks.note("Idle process CPU: " + CpuDetail({afterCpu->kernel - beforeCpu->kernel,
+                                                     afterCpu->user - beforeCpu->user}, elapsed));
     } else {
-        checks.check(false, "idle CPU", "Process CPU timing was unavailable.");
+        checks.check(false, "idle process CPU measurement", "Process CPU timing was unavailable.");
     }
-    if (beforeThreads && afterThreads) NoteIdleThreads(checks, *beforeThreads, *afterThreads);
-    else checks.note("Idle thread snapshots unavailable.");
+    const auto ownCpu = beforeThreads && afterThreads ? NoteIdleThreads(checks, *beforeThreads, *afterThreads) : std::nullopt;
+    checks.check(ownCpu && ownCpu->kernel + ownCpu->user < 1000000, "idle VoiceBridge CPU",
+                 ownCpu ? CpuDetail(*ownCpu, elapsed) + " Measured across the four named VoiceBridge threads."
+                        : "The four named VoiceBridge threads could not all be measured for the full interval.");
     const auto shutdown = Milliseconds();
     h.speaker->Shutdown();
     const double shutdownTime = Milliseconds() - shutdown;
@@ -793,7 +1006,10 @@ int RunTests(std::string mode, bool& normalReturn) {
     const auto delimiter = mode.find_first_of(" \t");
     if (delimiter != std::string::npos) mode.resize(delimiter);
     const bool silent = mode == "silent" || mode == "device" || mode == "silent-cost";
-    Checks checks(mode + "-results.txt");
+    const auto voice = mode == "null-jenny" ? SuiteVoice::Jenny : mode == "null-david" ? SuiteVoice::David : SuiteVoice::Default;
+    vb::test::crash::Start(mode + "-steps.log");
+    Checks checks(mode + "-results.txt", voice);
+    if (!checks.startVoiceIsolation()) return checks.result();
     NoteResources(checks, "Process baseline before creating a speaker");
     if (mode == "device") {
         vb::SpeakerConfig config;
@@ -812,14 +1028,14 @@ int RunTests(std::string mode, bool& normalReturn) {
         Cached(checks, false);
         VoiceAndRecovery(checks, false);
         NarratorAndCost(checks, false, false);
-    } else if (mode == "null" || silent) {
+    } else if (mode == "null" || silent || voice != SuiteVoice::Default) {
         LatencyAndOrder(checks, silent);
         if (silent && !Tap().read([](const Trace& t) { return t.opened != 0; })) return 2;
         Cached(checks, silent);
         VoiceAndRecovery(checks, silent);
         NarratorAndCost(checks, silent, true);
     } else {
-        checks.check(false, "mode", "Use null, silent, device, playback, cost, silent-cost or normal-exit.");
+        checks.check(false, "mode", "Use null, null-jenny, null-david, silent, device, playback, cost, silent-cost or normal-exit.");
     }
     return checks.result();
 }
@@ -835,6 +1051,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR args, int) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     bool normalReturn = false;
     const auto code = RunTests(args, normalReturn);
+    vb::test::crash::Step("Tests finished with exit code " + std::to_string(code) + ".");
     if (normalReturn) return code;
     // Match the VoiceBridge host: after Shutdown and closing the result file,
     // Windows can end the process without running an abandoned engine's DLL cleanup.

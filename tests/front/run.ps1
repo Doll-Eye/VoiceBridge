@@ -1,7 +1,10 @@
-param([ValidateSet('rpc','full')] [string] $Mode, [string] $TestDirectory)
+param([ValidateSet('rpc','full')] [string] $Mode, [string] $TestDirectory, [scriptblock] $WaitNoConflicts)
 $ErrorActionPreference = 'Stop'
 if ((Get-Process -Id $PID).SessionId -ne 0) { throw 'Expected SSH session zero.' }
-if ($TestDirectory -ine 'C:\VoiceBridge-test\front') { throw 'Expected the dedicated VoiceBridge test directory.' }
+if ($TestDirectory -ine 'C:\VoiceBridge-test\front' -and
+    $TestDirectory -notmatch '\AC:\\VoiceBridge-front-test-[a-f0-9]{32}\z') {
+    throw 'Expected a dedicated VoiceBridge front test directory.'
+}
 if (Get-Process -Name nvda,nvda_uiAccess,nvda_noUIAccess,VoiceBridge -ErrorAction SilentlyContinue |
     Where-Object { $_.SessionId -eq 0 }) { throw 'An NVDA or VoiceBridge process already exists in the SSH session.' }
 Set-Location -LiteralPath $TestDirectory
@@ -22,6 +25,7 @@ function Start-Test([string] $Name, [string] $Arguments) {
     $info.Arguments = $Arguments
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
+    $info.EnvironmentVariables['VOICEBRIDGE_FRONT_TEST_DIRECTORY'] = $TestDirectory
     $child = [Diagnostics.Process]::Start($info)
     $children.Add($child)
     $child
@@ -440,3 +444,6 @@ try {
         }
     }
 }
+
+$restart = [scriptblock]::Create([IO.File]::ReadAllText((Join-Path $TestDirectory 'restart.ps1')))
+& $restart $TestDirectory $WaitNoConflicts

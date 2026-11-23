@@ -108,3 +108,35 @@ $(BUILD)/signin-bridge.exe: $(TEST)/test-logon.cpp $(FRONT)/process.h $(filter-o
 
 tests: $(BUILD)/stuck-bridge.exe $(BUILD)/settings-test.exe $(BUILD)/signin-bridge.exe
 endif
+
+# The integration fixture drives the production supervisor and voice engine in
+# session zero. Only the test build exposes stalls and packet observations.
+RESTART_FRONT_OBJECTS := $(patsubst src/%.cpp,$(BUILD)/restart/%.o,$(filter-out $(FRONT)/log_speaker.cpp,$(wildcard $(FRONT)/*.cpp)))
+RESTART_VOICE_OBJECTS := $(patsubst src/%.cpp,$(BUILD)/restart/%.o,$(wildcard src/voice/*.cpp))
+RESTART_STUBS := $(addprefix $(BUILD)/x64/,controller_c.o controller_s.o)
+RESTART_LIBS := $(shell cat src/voice/LIBS.txt)
+RESTART_DRIVER_OBJECT := $(BUILD)/restart/tests/restart-driver.o
+RESTART_SPEAKER_OBJECT := $(BUILD)/restart/tests/restart-speaker.o
+
+.PHONY: restart-tests
+restart-tests: $(BUILD)/restart-bridge.exe $(BUILD)/restart-driver.exe
+
+$(BUILD)/restart/voice/speaker.o: RESTART_DEFINES := -DCreateServerSpeaker=CreateInstrumentedSpeaker
+$(BUILD)/restart/front/main.o: RESTART_DEFINES := -DVB_RESTART_TEST
+$(BUILD)/restart/front/ping.o: CXXFLAGS += -fno-exceptions -fno-reorder-blocks
+
+$(BUILD)/restart/%.o: src/%.cpp $(BUILD)/x64/controller.h $(FRONT)/build.mk
+	@mkdir -p $(@D)
+	$(TOOL64)-g++ $(CPPFLAGS) $(CXXFLAGS) -DVB_VOICE_TEST $(RESTART_DEFINES) -I$(BUILD)/x64 -c $< -o $@
+
+$(BUILD)/restart/tests/%.o: $(TEST)/%.cpp $(BUILD)/x64/controller.h $(FRONT)/build.mk
+	@mkdir -p $(@D)
+	$(TOOL64)-g++ $(CPPFLAGS) $(CXXFLAGS) -DVB_VOICE_TEST -iquote $(FRONT) -I$(BUILD)/x64 -c $< -o $@
+
+$(BUILD)/restart-bridge.exe: $(RESTART_FRONT_OBJECTS) $(RESTART_VOICE_OBJECTS) $(RESTART_SPEAKER_OBJECT) $(RESTART_STUBS) src/voice/LIBS.txt
+	$(TOOL64)-g++ $(GUI) -o $@ $(filter %.o,$^) $(RPC) $(BRIDGE_LIBS) $(RESTART_LIBS)
+
+$(BUILD)/restart-driver.exe: $(RESTART_DRIVER_OBJECT) $(BUILD)/x64/controller_c.o $(addprefix $(BUILD)/restart/front/,rpc_alloc.o endpoint.o ping.o)
+	$(TOOL64)-g++ $(GUI) -o $@ $^ $(RPC)
+
+-include $(RESTART_FRONT_OBJECTS:.o=.d) $(RESTART_VOICE_OBJECTS:.o=.d) $(RESTART_DRIVER_OBJECT:.o=.d) $(RESTART_SPEAKER_OBJECT:.o=.d)

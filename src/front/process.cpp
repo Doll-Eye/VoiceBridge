@@ -169,9 +169,10 @@ NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& exec
     return match;
 }
 
-Handle CreateNvdaStartupMutex(const std::wstring& name) {
+Handle CreateNvdaStartupMutex(const std::wstring& name, bool& alreadyExists) {
     // CreateMutexW in NVDA requests full access. Preserve access for this
     // user at ordinary integrity even if VoiceBridge was started elevated.
+    alreadyExists = false;
     HANDLE rawToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) return {};
     const Handle token(rawToken);
@@ -188,24 +189,24 @@ Handle CreateNvdaStartupMutex(const std::wstring& name) {
                                                               &descriptor, nullptr)) return {};
     SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
     Handle mutex(CreateMutexW(&security, TRUE, name.c_str()));
-    const bool existed = GetLastError() == ERROR_ALREADY_EXISTS;
+    alreadyExists = GetLastError() == ERROR_ALREADY_EXISTS;
     LocalFree(descriptor);
-    if (existed) return {};
+    if (alreadyExists) return {};
     return mutex;
 }
 
-bool HasOtherMutexHandle(HANDLE mutex) {
+std::optional<bool> HasOtherMutexHandle(HANDLE mutex) {
     using Query = decltype(&NtQueryObject);
     static const auto query = reinterpret_cast<Query>(reinterpret_cast<uintptr_t>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
     PUBLIC_OBJECT_BASIC_INFORMATION info{};
     // NVDA opens the existing mutex before it waits on it. Yield on a query
     // failure too: serving must never depend on guessing a launcher's image.
-    return !query || query(mutex, ObjectBasicInformation, &info, sizeof(info), nullptr) < 0 ||
-           info.HandleCount != 1;
+    if (!query || query(mutex, ObjectBasicInformation, &info, sizeof(info), nullptr) < 0) return std::nullopt;
+    return info.HandleCount != 1;
 }
 
-ServerProcess StartServer(const std::filesystem::path& executable) {
+ServerProcess StartServer(const std::filesystem::path& executable, HANDLE journal) {
     ServerProcess server;
     server.job.reset(CreateJobObjectW(nullptr, nullptr));
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -215,7 +216,8 @@ ServerProcess StartServer(const std::filesystem::path& executable) {
     SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
     server.stop.reset(CreateEventW(&inherit, TRUE, FALSE, nullptr));
     if (!server.stop) return {};
-    HANDLE event = server.stop.get(), job = server.job.get();
+    HANDLE inherited[] = {server.stop.get(), journal};
+    HANDLE job = server.job.get();
     SIZE_T size = 0;
     InitializeProcThreadAttributeList(nullptr, 2, 0, &size);
     std::vector<BYTE> buffer(size);
@@ -225,13 +227,14 @@ ServerProcess StartServer(const std::filesystem::path& executable) {
     if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 2, 0, &size)) return {};
     PROCESS_INFORMATION child{};
     auto command = L"\"" + executable.wstring() + L"\" --rpc-worker " +
-                   std::to_wstring(reinterpret_cast<uintptr_t>(event));
+                   std::to_wstring(reinterpret_cast<uintptr_t>(server.stop.get())) + L" " +
+                   std::to_wstring(reinterpret_cast<uintptr_t>(journal));
     // Job membership is atomic with creation. Even a crashing supervisor
     // cannot leave an orphan with the controller endpoint.
     bool started = UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
                                              &job, sizeof(job), nullptr, nullptr) &&
                    UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                             &event, sizeof(event), nullptr, nullptr) &&
+                                             inherited, sizeof(inherited), nullptr, nullptr) &&
                    CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
                                   CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
                                   nullptr, nullptr, &startup.StartupInfo, &child);

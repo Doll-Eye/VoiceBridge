@@ -9,6 +9,8 @@ inline constexpr wchar_t SupervisorMutex[] = L"Local\\VoiceBridge.Supervisor";
 inline constexpr wchar_t ServerMutex[] = L"Local\\VoiceBridge.Server";
 inline constexpr wchar_t NvdaWindowClass[] = L"wxWindowClassNR";
 inline constexpr wchar_t NvdaWindowTitle[] = L"NVDA";
+inline constexpr DWORD ServerStandAside = 3;
+inline constexpr DWORD ControllerProbeTimedOut = 73;
 
 struct NvdaProcess {
     DWORD pid = 0;
@@ -28,7 +30,7 @@ struct ServerProcess {
 };
 
 // Start suspended so the parent can take NVDA's desktop mutex before RPC starts.
-ServerProcess StartServer(const std::filesystem::path& executable);
-Handle CreateNvdaStartupMutex(const std::wstring& name);
-bool HasOtherMutexHandle(HANDLE mutex);
+ServerProcess StartServer(const std::filesystem::path& executable, HANDLE journal);
+Handle CreateNvdaStartupMutex(const std::wstring& name, bool& alreadyExists);
+std::optional<bool> HasOtherMutexHandle(HANDLE mutex);
 }

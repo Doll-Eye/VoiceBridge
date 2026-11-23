@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace {
@@ -21,7 +22,10 @@ using vb::voice::test::Observation;
 struct Results {
     unsigned workers = 0, warm = 0, stalls = 0, retired = 0;
     std::map<unsigned long long, unsigned> completions, frames, rates;
-    Clock::time_point firstStall{}, firstRetirement{};
+    std::set<DWORD> lifecycleOwners, liveLifecycleThreads, gatedWarmThreads;
+    DWORD releaseThread = 0;
+    bool releaseHeldLease = false, releaseLeftLease = false, liveLifecycleOverlap = false;
+    Clock::time_point firstStall{}, firstRetirement{}, releaseStarted{}, twoReplacementsWarmed{};
 };
 
 Results events;
@@ -32,13 +36,40 @@ void Observe(const Observation& observation) {
     std::lock_guard<std::mutex> lock(eventMutex);
     switch (observation.kind) {
     case Kind::WorkerStarted: ++events.workers; break;
-    case Kind::Warmed: ++events.warm; break;
+    case Kind::Warmed: {
+        ++events.warm;
+        const auto thread = GetCurrentThreadId();
+        if (events.liveLifecycleThreads.count(thread) && events.gatedWarmThreads.insert(thread).second &&
+            events.gatedWarmThreads.size() == 2) events.twoReplacementsWarmed = Clock::now();
+        break;
+    }
     case Kind::StallEntered:
         if (!events.stalls++) events.firstStall = Clock::now();
         break;
     case Kind::Abandoned:
         if (!events.retired++) events.firstRetirement = Clock::now();
         break;
+    case Kind::ReleaseStalled:
+        events.releaseThread = GetCurrentThreadId();
+        events.releaseStarted = Clock::now();
+        events.releaseHeldLease = events.lifecycleOwners.count(events.releaseThread) != 0;
+        break;
+    case Kind::LifecycleEntered: {
+        const auto thread = GetCurrentThreadId();
+        events.lifecycleOwners.insert(thread);
+        if (events.releaseThread && thread != events.releaseThread) {
+            events.liveLifecycleThreads.insert(thread);
+            events.liveLifecycleOverlap |=
+                events.lifecycleOwners.size() - events.lifecycleOwners.count(events.releaseThread) > 1;
+        }
+        break;
+    }
+    case Kind::LifecycleLeft: {
+        const auto thread = GetCurrentThreadId();
+        events.lifecycleOwners.erase(thread);
+        if (thread == events.releaseThread) events.releaseLeftLease = true;
+        break;
+    }
     case Kind::Complete: ++events.completions[observation.id]; break;
     case Kind::Packet:
         events.rates[observation.id] = observation.rate;
@@ -90,6 +121,9 @@ public:
             std::lock_guard<std::mutex> lock(eventMutex);
             events = {};
         }
+        speaker = startSpeaker();
+    }
+    std::unique_ptr<vb::ISpeaker> startSpeaker() {
         vb::SpeakerConfig config;
         config.nullOutput = true;
         config.silentOutput = true;
@@ -97,7 +131,7 @@ public:
         config.followNarrator = false;
         config.voice = L"Jenny (Natural)";
         config.fallbackVoice = L"David";
-        speaker = vb::CreateSpeaker(config, log);
+        return vb::CreateSpeaker(config, log);
     }
     ~Fixture() {
         speaker->Shutdown();
@@ -138,6 +172,54 @@ void CallDeadline() {
     SetEnvironmentVariableA("VOICEBRIDGE_TEST_CALL_STALL", nullptr);
 }
 
+void BlockedLifecycleCall() {
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_LIFECYCLE_STALL", "1");
+    {
+        Fixture h;
+        h.speaker->Speak(L"Queued during setup.");
+        const bool recovered = Wait(15s, [](const Results& r) { return r.warm >= 2; });
+        const auto r = Snapshot();
+        Check(recovered && r.workers == 3 && r.retired == 1 && r.stalls == 1,
+              "Only the blocked lifecycle owner timed out. Its waiter and replacement both warmed.");
+        Check(recovered && h.played(1), "Speech queued behind a blocked lifecycle call played once.");
+    }
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_LIFECYCLE_STALL", nullptr);
+}
+
+void ReleaseStall() {
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_RELEASE_STALL", "1");
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_LIFECYCLE_DELAY", "1");
+    {
+        Fixture h;
+        const bool ready = Wait(10s, [](const Results& r) { return r.warm >= 2; });
+        Check(ready, "Both original workers warmed before the release stall.");
+        if (ready) {
+            h.speaker->Speak(L"Repeat this item if the voice fails.");
+            const bool stalled = Wait(5s, [](const Results& r) { return r.releaseThread != 0; });
+            Check(stalled && Snapshot().releaseHeldLease, "The retiring worker stalled in Release while holding its lease.");
+            if (stalled) {
+                // The gate is process-wide. Start two more workers against it
+                // without resetting the observation stream or releasing the stall.
+                auto competingSpeaker = h.startSpeaker();
+                const bool warmed = Wait(5s, [](const Results& r) { return r.gatedWarmThreads.size() >= 2; });
+                const auto r = Snapshot();
+                const auto elapsed = std::chrono::duration<double>(r.twoReplacementsWarmed - r.releaseStarted).count();
+                Check(warmed && elapsed <= 5 && !r.releaseLeftLease,
+                      "Two distinct workers took live leases and warmed within five seconds while Release remained blocked.");
+                Check(warmed && !r.liveLifecycleOverlap,
+                      "Live workers entered lifecycle sections one at a time after the release stalled.");
+                if (warmed) report << "Two workers warmed after the release stall in " << elapsed << " s." << std::endl;
+                vb::voice::test::ReleaseTestStalls();
+                Check(Wait(5s, [](const Results& r) { return r.releaseLeftLease; }),
+                      "The retiring worker left its lease when the test released the stall.");
+                competingSpeaker->Shutdown();
+            }
+        }
+    }
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_LIFECYCLE_DELAY", nullptr);
+    SetEnvironmentVariableA("VOICEBRIDGE_TEST_RELEASE_STALL", nullptr);
+}
+
 void RepeatedStalls() {
     Fixture h;
     if (!Wait(10s, [](const Results& r) { return r.warm == 2; })) {
@@ -146,6 +228,7 @@ void RepeatedStalls() {
     }
     vb::voice::test::SetTestStalls(8);
     h.speaker->Speak(L"Discard this.");
+    h.speaker->Speak(L"Discard the next item, too.");
     const bool allBlocked = Wait(15s, [](const Results& r) { return r.retired == 4; });
     const auto before = Snapshot();
     auto begin = Clock::now();
@@ -158,12 +241,13 @@ void RepeatedStalls() {
     Check(allBlocked && before.workers == 4 && bounded.workers == 4 && bounded.stalls == 4,
           "Four held engine calls exhausted the worker budget without starting a fifth worker.");
     vb::voice::test::ReleaseTestStalls();
-    bool played = h.played(2);
+    bool played = h.played(3);
     auto after = Snapshot();
-    Check(played && !after.frames[1] && after.frames[2] && after.completions[2] == 1,
-          "The replacement phrase played once after capacity returned. The cancelled phrase supplied zero frames.");
+    Check(played && !after.frames[1] && !after.frames[2] && after.frames[3] && after.completions[3] == 1,
+          "The replacement phrase played once after capacity returned. The cancelled phrases supplied zero frames.");
     report << "Cancel and Speak returned in " << elapsed << " ms. Held workers: " << bounded.workers
-           << ". Pre-cancel frames: " << after.frames[1] << ". Replacement frames: " << after.frames[2] << std::endl;
+           << ". Pre-cancel frames: " << after.frames[1] + after.frames[2]
+           << ". Replacement frames: " << after.frames[3] << std::endl;
 }
 
 void RuntimeFailure() {
@@ -216,6 +300,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     report.open("recovery-results.txt");
     report << std::fixed << std::setprecision(3);
     CallDeadline();
+    BlockedLifecycleCall();
+    ReleaseStall();
     RepeatedStalls();
     RuntimeFailure();
     SilentWarm();

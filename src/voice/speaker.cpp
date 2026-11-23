@@ -1,4 +1,5 @@
 #include "voice_internal.h"
+#include "../common/speech_journal.h"
 
 #include <algorithm>
 #include <cwctype>
@@ -65,6 +66,14 @@ void State::disconnectLog() {
     log = nullptr;
 }
 
+void State::beginReplay(Job& job) {
+    if (std::exchange(job.recoveredFromJournal, false)) journal->beginReplay(job.journalCursor);
+}
+
+void State::retire(Job& job) {
+    if (job.journalCursor) journal->retire(std::exchange(job.journalCursor, 0));
+}
+
 void State::queueChunk(Chunk chunk) {
     waiting += chunk.format.seconds(chunk.count);
     chunk.job->bufferedFrames += chunk.count;
@@ -90,8 +99,17 @@ void State::consume(size_t frames) {
 
 class Speaker final : public ISpeaker {
 public:
-    Speaker(const SpeakerConfig& config, ILog& log) : state_(std::make_shared<State>(config, log)) {
+    Speaker(const SpeakerConfig& config, ILog& log, SpeechJournal* journal = nullptr, HANDLE exhausted = nullptr)
+        : state_(std::make_shared<State>(config, log, journal, exhausted)) {
         auto state = state_;
+        if (journal) {
+            for (auto& entry : journal->recover(&log)) {
+                auto job = std::make_shared<Job>(++state->lastJob, state->generation.load(), std::move(entry.text));
+                job->journalCursor = entry.cursor;
+                job->recoveredFromJournal = true;
+                state->jobs.push_back(std::move(job));
+            }
+        }
         try {
             StartVoiceThread(L"VoiceBridge audio", [state] {
                 try {
@@ -133,7 +151,14 @@ public:
 #ifdef VB_VOICE_TEST
         test::Observe({test::Kind::Spoke, job->id, job->generation});
 #endif
-        state.jobs.push_back(std::move(job));
+        state.jobs.push_back(job);
+        // Publish to the supervisor-owned mapping last, before RPC acknowledges.
+        try {
+            if (state.journal) job->journalCursor = state.journal->append(job->text);
+        } catch (...) {
+            state.jobs.pop_back();
+            throw;
+        }
         state.dispatch.signal();
     }
 
@@ -142,6 +167,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             if (state.stop) return;
+            if (state.journal) state.journal->clear();
             ++state.generation;
             clear(state);
             const auto now = Clock::now();
@@ -197,6 +223,11 @@ namespace vb {
 
 std::unique_ptr<ISpeaker> CreateSpeaker(const SpeakerConfig& config, ILog& log) {
     return std::make_unique<voice::Speaker>(config, log);
+}
+
+std::unique_ptr<ISpeaker> CreateServerSpeaker(const SpeakerConfig& config, ILog& log,
+                                             SpeechJournal& journal, HANDLE exhausted) {
+    return std::make_unique<voice::Speaker>(config, log, &journal, exhausted);
 }
 
 }  // namespace vb

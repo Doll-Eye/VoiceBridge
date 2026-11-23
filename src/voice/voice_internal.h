@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../common/speaker.h"
+#include "../common/server_speaker.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -132,6 +132,9 @@ struct Job {
     const std::uint64_t generation;
     const std::wstring text;
     std::map<std::wstring, unsigned> failedTokens;
+    unsigned timeouts = 0;
+    std::uint64_t journalCursor = 0;
+    bool recoveredFromJournal = false;
     bool published = false;  // At least one chunk was queued, even if it has since drained.
     size_t bufferedFrames = 0;  // Protected by State::mutex.
     Time submittedUntil{};
@@ -148,8 +151,13 @@ struct Chunk {
 };
 
 struct State {
-    State(const SpeakerConfig& config, ILog& log) : config(config), log(&log) {}
+    State(const SpeakerConfig& config, ILog& log, SpeechJournal* journal, HANDLE exhausted)
+        : config(config), journal(journal), exhausted(exhausted), log(&log) {}
     const SpeakerConfig config;
+    SpeechJournal* const journal;
+    const HANDLE exhausted;
+    void beginReplay(Job& job);  // Caller holds mutex.
+    void retire(Job& job);  // Caller holds mutex.
 
     // The command queue, audio queue and publication of a device packet share a
     // lock. No waits, voice calls or device setup can hold it.

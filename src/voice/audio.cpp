@@ -113,7 +113,7 @@ public:
         }
 
 #ifndef VB_VOICE_TEST
-        if (!state_->config.silentOutput) {
+        if (!state_->config.silentOutput && state_->config.volume > 0) {
             ComPtr<ISimpleAudioVolume> volume;
             BOOL muted = FALSE;
             if (SUCCEEDED(client_->GetService(__uuidof(ISimpleAudioVolume), volume.voidOut())) &&
@@ -507,6 +507,9 @@ private:
             }
             return S_FALSE;
         }
+        // Commit before the first handoff. A crash inside ReleaseBuffer may cut
+        // this phrase short, but a replacement must never repeat it.
+        if (chunk) state_->retire(*chunk->job);
         if (hardware) {
             const auto hr = device_.submit(frames);
             if (FAILED(hr)) return hr;
@@ -534,7 +537,8 @@ private:
         }
         test::Observe({chunk ? test::Kind::Packet : test::Kind::Fade, chunk ? chunk->id : 0, generation_,
             std::chrono::duration<double, std::milli>(until_.time_since_epoch()).count(),
-            pcm.data(), frames * format_.channels, format_.rate, format_.channels});
+            pcm.data(), frames * format_.channels, format_.rate, format_.channels,
+            chunk ? chunk->job->text.c_str() : nullptr});
         if (chunk && injectAt_ == Forever && recoverAt_ == Forever) {
             const bool repeat = testRepeatedDeviceLoss_ && hardware && lastLossJob_ != chunk->id;
             if (repeat || (!injected_ && test::Flag("VOICEBRIDGE_TEST_DEVICE_LOSS"))) {

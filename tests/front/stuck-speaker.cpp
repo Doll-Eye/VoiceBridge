@@ -1,4 +1,4 @@
-#include "../../src/common/speaker.h"
+#include "../../src/common/server_speaker.h"
 #include "../../src/front/handle.h"
 
 namespace vb {
@@ -25,5 +25,9 @@ public:
 std::unique_ptr<ISpeaker> CreateSpeaker(const SpeakerConfig&, ILog&) {
     WaitForEvent(L"Local\\VoiceBridge.Test.DelayCreate");
     return std::make_unique<StuckSpeaker>();
+}
+
+std::unique_ptr<ISpeaker> CreateServerSpeaker(const SpeakerConfig& config, ILog& log, SpeechJournal&, HANDLE) {
+    return CreateSpeaker(config, log);
 }
 }

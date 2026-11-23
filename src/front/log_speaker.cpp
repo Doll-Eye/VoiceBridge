@@ -1,4 +1,4 @@
-#include "../common/speaker.h"
+#include "../common/server_speaker.h"
 
 namespace vb {
 namespace {
@@ -26,5 +26,9 @@ private:
 
 std::unique_ptr<ISpeaker> CreateSpeaker(const SpeakerConfig&, ILog& log) {
     return std::make_unique<LogSpeaker>(log);
+}
+
+std::unique_ptr<ISpeaker> CreateServerSpeaker(const SpeakerConfig& config, ILog& log, SpeechJournal&, HANDLE) {
+    return CreateSpeaker(config, log);
 }
 }

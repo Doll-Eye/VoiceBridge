@@ -1,4 +1,6 @@
 #include "log.h"
+#include "../common/server_speaker.h"
+#include "../common/speech_journal.h"
 #include "process.h"
 #include "controller_rpc.h"
 
@@ -7,10 +9,22 @@
 #include <algorithm>
 #include <cstdlib>
 
+#ifdef VB_RESTART_TEST
+namespace vb { void BeforeRestartTestControllerProbe(); }
+#endif
+
 namespace {
 using namespace vb;
 
 constexpr DWORD NvdaCheckMs = 500;
+// A server that ran this long before failing was healthy: its failure starts a
+// new run of failures instead of extending the last one. Recovering from one
+// stall or crash takes well under half of this.
+#ifdef VB_RESTART_TEST
+constexpr ULONGLONG HealthyRunMs = 30000;
+#else
+constexpr ULONGLONG HealthyRunMs = 60000;
+#endif
 
 [[noreturn]] void Finish(Log& log, UINT code) {
     log.FlushAndStop(75);
@@ -27,7 +41,7 @@ constexpr DWORD NvdaCheckMs = 500;
 
 [[noreturn]] void StandAside(Log& log, const std::wstring& reason) {
     log.Write(LogLevel::Info, L"Standing aside because " + reason);
-    Finish(log, 3);
+    Finish(log, ServerStandAside);
 }
 
 bool Stopping(HANDLE stop) {
@@ -55,25 +69,32 @@ int Stop() {
 // NVDA's ordinary, ease-of-access and restart paths all acquire this mutex
 // before registering RPC. Only create it while absent. Never wait for NVDA's
 // mutex or keep a handle to an existing one.
-DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) {
+DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log, SpeechJournalMapping& journal) {
     const auto desktop = DesktopName();
     if (desktop.empty()) return ERROR_INVALID_NAME;
     const auto name = L"Local\\NVDA_" + desktop;
-    auto server = StartServer(executable);
+    if (!journal.handle() && !journal.create()) {
+        log.Write(LogLevel::Error, L"Could not create the pending speech queue");
+        return 1;
+    }
+    auto server = StartServer(executable, journal.handle());
     if (!server.process) {
         log.Write(LogLevel::Error, L"Could not start server (" + std::to_wstring(GetLastError()) + L")");
         return 1;
     }
-    const auto gate = CreateNvdaStartupMutex(name);
-    DWORD code = 3;
-    bool requested = false;
-    if (gate && !HasOtherMutexHandle(gate.get()) && !Stopping(stop) &&
+    bool alreadyExists = false;
+    const auto gate = CreateNvdaStartupMutex(name, alreadyExists);
+    const auto nvda = gate ? HasOtherMutexHandle(gate.get()) : std::optional<bool>(alreadyExists);
+    DWORD code = 1;
+    bool requested = Stopping(stop);
+    if (gate && nvda == false && !requested &&
         ResumeThread(server.thread.get()) != static_cast<DWORD>(-1)) {
         const HANDLE waitFor[] = {server.process.get(), stop};
         for (;;) {
             const DWORD wait = WaitForMultipleObjects(2, waitFor, FALSE, 100);
             if (wait == WAIT_OBJECT_0) break;
-            if (wait != WAIT_TIMEOUT || HasOtherMutexHandle(gate.get())) {
+            const auto competing = HasOtherMutexHandle(gate.get());
+            if (wait == WAIT_OBJECT_0 + 1 || competing == true) {
                 requested = true;
                 SetEvent(server.stop.get());
                 if (WaitForSingleObject(server.process.get(), 200) != WAIT_OBJECT_0) {
@@ -81,9 +102,15 @@ DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) 
                 }
                 break;
             }
+            if (wait != WAIT_TIMEOUT || !competing.has_value()) {
+                TerminateProcess(server.process.get(), 1);
+                break;
+            }
         }
     } else {
         // The worker is still suspended and has never owned an endpoint.
+        if (requested) code = 0;
+        else if (nvda == true) code = ServerStandAside;
         TerminateProcess(server.process.get(), code);
     }
     WaitForSingleObject(server.process.get(), INFINITE);
@@ -92,6 +119,8 @@ DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) 
     if (!gate) log.Write(LogLevel::Info, L"Standing aside because the NVDA startup mutex is unavailable");
     if (requested) log.Write(LogLevel::Info, L"Released the controller after a stop or NVDA startup request");
     GetExitCodeProcess(server.process.get(), &code);
+    // A stop or handover ends this game's queue. Keep it across a worker crash.
+    if (requested || code == 0 || code == ServerStandAside) journal.reset();
     return code;
 }
 
@@ -125,13 +154,17 @@ ULONGLONG SignInDeadline(const Settings& settings, Log& log) {
     log.Write(LogLevel::Info, L"Started");
     DWORD backoff = 1000;
     DWORD waitingPid = 0;
+    unsigned consecutiveSpeechFailures = 0;
+    SpeechJournalMapping journal;
     auto signInDeadline = SignInDeadline(settings, log);
     while (!Stopping(stop)) {
         const auto nvda = FindNvda(settings, executable);
         if (nvda.pid) {
             signInDeadline = 0;
             backoff = 1000;
+            consecutiveSpeechFailures = 0;
             if (waitingPid != nvda.pid) {
+                if (journal.handle()) journal.reset();
                 log.Write(LogLevel::Info, L"Waiting for NVDA process " + std::to_wstring(nvda.pid));
                 if (!nvda.handle) {
                     log.Write(LogLevel::Error, L"Cannot open the NVDA process for synchronization");
@@ -156,17 +189,40 @@ ULONGLONG SignInDeadline(const Settings& settings, Log& log) {
             WaitForSingleObject(stop, static_cast<DWORD>(std::min<ULONGLONG>(signInDeadline - started, NvdaCheckMs)));
             continue;
         }
+        DWORD code = 1;
         {
             // Direct --serve and the supervisor share this one serving slot.
             const Handle slot(CreateMutexW(nullptr, TRUE, ServerMutex));
             if (slot && GetLastError() != ERROR_ALREADY_EXISTS) {
-                const auto code = RunServer(stop, executable, log);
-                log.Write(code != 0 && code != 3 ? LogLevel::Error : LogLevel::Info,
+                code = RunServer(stop, executable, log, journal);
+                log.Write(code != 0 && code != ServerStandAside ? LogLevel::Error : LogLevel::Info,
                           L"Server exited with code " + std::to_wstring(code));
             }
         }
         if (Stopping(stop)) break;
-        if (GetTickCount64() - started >= 5000) {
+        const auto ran = GetTickCount64() - started;
+        if (ran >= HealthyRunMs) {
+            // Rare failures far apart must never add up to a lost queue or a long wait.
+            consecutiveSpeechFailures = 0;
+            backoff = 1000;
+        }
+        const bool speechFailure = code == SpeechWorkersStuck || (code & 0xC0000000) == 0xC0000000;
+        const bool cleanExit = code == 0 || code == ServerStandAside;
+        if (speechFailure) {
+            consecutiveSpeechFailures = std::min(consecutiveSpeechFailures + 1, 2U);
+            if (consecutiveSpeechFailures == 2) {
+                log.Write(LogLevel::Error, L"Discarding pending speech after consecutive server failures.");
+                journal.reset();
+            }
+        } else if (cleanExit) {
+            consecutiveSpeechFailures = 0;
+        }
+
+        // A watchdog exit calls for immediate recovery on its first failure.
+        // A startup probe timeout leaves the queue and speech failure count intact.
+        const bool firstFailure = speechFailure && consecutiveSpeechFailures == 1;
+        const bool ranSteadily = ran >= 5000;
+        if ((firstFailure && (code == SpeechWorkersStuck || ranSteadily)) || (cleanExit && ranSteadily)) {
             backoff = 1000;
         } else {
             log.Write(LogLevel::Info, L"Retrying server after " + std::to_wstring(backoff) + L" ms");
@@ -191,18 +247,21 @@ struct ServerStartup {
     const SpeakerConfig& config;
     Log& log;
     SpeakerLog speakerLog;
+    SpeechJournal& journal;
+    HANDLE exhausted;
     std::mutex mutex;
     ISpeaker* speaker = nullptr;
     bool stopping = false;
 
-    ServerStartup(const std::wstring& endpoint, const Settings& settings, Log& log)
-        : endpoint(endpoint), config(settings.speaker), log(log), speakerLog(log, settings.logText) {}
+    ServerStartup(const std::wstring& endpoint, const Settings& settings, Log& log, SpeechJournal& journal, HANDLE exhausted)
+        : endpoint(endpoint), config(settings.speaker), log(log), speakerLog(log, settings.logText),
+          journal(journal), exhausted(exhausted) {}
 };
 
 DWORD WINAPI StartServing(void* state) {
     auto& startup = *static_cast<ServerStartup*>(state);
     try {
-        auto speaker = CreateSpeaker(startup.config, startup.speakerLog);
+        auto speaker = CreateServerSpeaker(startup.config, startup.speakerLog, startup.journal, startup.exhausted);
         {
             const std::lock_guard<std::mutex> lock(startup.mutex);
             if (!startup.stopping) {
@@ -248,11 +307,14 @@ DWORD WINAPI ShutdownSpeaker(void* speaker) {
 }
 
 DWORD WINAPI ProbeController(void* endpoint) {
+#ifdef VB_RESTART_TEST
+    BeforeRestartTestControllerProbe();
+#endif
     return ControllerAnswers(*static_cast<std::wstring*>(endpoint)) ? 1 : 0;
 }
 
 [[noreturn]] void Serve(HINSTANCE instance, HANDLE stop, const Settings& settings,
-                        const std::filesystem::path& executable, Log& log) {
+                        const std::filesystem::path& executable, Log& log, SpeechJournal& journal) {
     log.Write(LogLevel::Info, L"Started");
     if (const auto nvda = FindNvda(settings, executable); nvda.pid) {
         StandAside(log, L"NVDA process " + std::to_wstring(nvda.pid) + L" is running");
@@ -265,7 +327,10 @@ DWORD WINAPI ProbeController(void* endpoint) {
     const HANDLE startupHandles[] = {stop, probe.get()};
     const DWORD probeWait = WaitForMultipleObjects(2, startupHandles, FALSE, 175);
     if (probeWait == WAIT_FAILED) Fail(log, L"Could not wait for the controller probe", GetLastError());
-    if (probeWait == WAIT_TIMEOUT) StandAside(log, L"the controller probe timed out at " + endpoint);
+    if (probeWait == WAIT_TIMEOUT) {
+        log.Write(LogLevel::Error, L"The controller probe timed out at " + endpoint);
+        Finish(log, ControllerProbeTimedOut);
+    }
     if (probeWait == WAIT_OBJECT_0 + 1) {
         DWORD answered = 0;
         GetExitCodeThread(probe.get(), &answered);
@@ -293,12 +358,18 @@ DWORD WINAPI ProbeController(void* endpoint) {
         Fail(log, L"Could not create the VoiceBridge window", GetLastError());
     }
 
-    ServerStartup startup(endpoint, settings, log);
+    Handle exhausted(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!exhausted) Fail(log, L"Could not create the speech watchdog event", GetLastError());
+    ServerStartup startup(endpoint, settings, log, journal, exhausted.get());
     Handle worker(CreateThread(nullptr, 0, StartServing, &startup, 0, nullptr));
     if (!worker) Fail(log, L"Could not start RPC and speaker worker", GetLastError());
     auto nextScan = GetTickCount64() + NvdaCheckMs;
     for (;;) {
         if (Stopping(stop)) StopServing(startup, L"stop event");
+        if (Stopping(exhausted.get())) {
+            log.Write(LogLevel::Error, L"All four SAPI workers exceeded their watchdog while speech was waiting. Restarting the server.");
+            Finish(log, SpeechWorkersStuck);
+        }
         MSG message;
         for (int count = 0; count < 64 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++count) {
             if (message.message == WM_QUIT) {
@@ -321,7 +392,8 @@ DWORD WINAPI ProbeController(void* endpoint) {
             GetExitCodeThread(worker.get(), &status);
             worker.reset();
             if (status == RPC_S_DUPLICATE_ENDPOINT) {
-                StopServing(startup, L"standing aside because the endpoint is already bound at " + endpoint, 3);
+                StopServing(startup, L"standing aside because the endpoint is already bound at " + endpoint,
+                            ServerStandAside);
             }
             if (status != RPC_S_OK) {
                 log.Write(LogLevel::Error, L"Startup failed at " + endpoint + L" (" + std::to_wstring(status) + L")");
@@ -329,10 +401,10 @@ DWORD WINAPI ProbeController(void* endpoint) {
             }
         }
 
-        const HANDLE handles[] = {stop, worker.get()};
+        const HANDLE handles[] = {stop, exhausted.get(), worker.get()};
         now = GetTickCount64();
         const DWORD remaining = now >= nextScan ? 0 : static_cast<DWORD>(nextScan - now);
-        if (MsgWaitForMultipleObjectsEx(worker ? 2 : 1, handles, remaining, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+        if (MsgWaitForMultipleObjectsEx(worker ? 3 : 2, handles, remaining, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
             == WAIT_FAILED) {
             StopServing(startup, L"message wait failed (" + std::to_wstring(GetLastError()) + L")", 1);
         }
@@ -347,13 +419,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!argv) return 1;
     const bool stopping = count == 2 && wcscmp(argv[1], L"--stop") == 0;
     const bool server = count == 2 && wcscmp(argv[1], L"--serve") == 0;
-    const bool worker = count == 3 && wcscmp(argv[1], L"--rpc-worker") == 0;
+    const bool worker = count == 4 && wcscmp(argv[1], L"--rpc-worker") == 0;
     HANDLE workerStop = nullptr;
+    SpeechJournal journal;
     if (worker) {
-        wchar_t* end = nullptr;
-        workerStop = reinterpret_cast<HANDLE>(wcstoull(argv[2], &end, 10));
-        DWORD flags = 0;
-        if (*end || !GetHandleInformation(workerStop, &flags) || !(flags & HANDLE_FLAG_INHERIT)) {
+        auto inherited = [](const wchar_t* argument) -> HANDLE {
+            wchar_t* end = nullptr;
+            auto handle = reinterpret_cast<HANDLE>(wcstoull(argument, &end, 10));
+            DWORD flags = 0;
+            return !*end && GetHandleInformation(handle, &flags) && (flags & HANDLE_FLAG_INHERIT) ? handle : nullptr;
+        };
+        workerStop = inherited(argv[2]);
+        const auto mapping = inherited(argv[3]);
+        if (!workerStop || !mapping || !journal.map(mapping)) {
             LocalFree(argv);
             return 2;
         }
@@ -379,12 +457,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     const auto settings = ReadSettings(directory);
     if (worker) {
         Log log(directory, L"server", settings.level);
-        Serve(instance, workerStop, settings, executable, log);
+        Serve(instance, workerStop, settings, executable, log, journal);
     }
     Log log(directory, server ? L"guard" : L"supervisor", settings.level);
     if (server) {
         if (roleExists) StandAside(log, L"a VoiceBridge server is already running");
-        Finish(log, RunServer(stop.get(), executable, log));
+        SpeechJournalMapping directJournal;
+        Finish(log, RunServer(stop.get(), executable, log, directJournal));
     }
     Supervise(stop.get(), settings, executable, log);
 }

@@ -10,7 +10,7 @@ enum class Kind {
     Spoke, Cancelled, Buffered, RawOnset, Packet, Fade, Complete, CacheHit,
     Abandoned, Warmed, DeviceOpened, DeviceLost, DeviceRestored, IdleStopped,
     DeviceStarted, DeviceWatchdog, HardwareQueued, RenderStarved, CacheBytes, CacheEvicted,
-    WorkerStarted, StallEntered
+    WorkerStarted, StallEntered, ReleaseStalled, LifecycleEntered, LifecycleLeft
 };
 
 struct Observation {
@@ -22,6 +22,7 @@ struct Observation {
     size_t count = 0;
     unsigned rate = 0;
     unsigned channels = 0;
+    const wchar_t* text = nullptr;
 };
 
 // Calls come from the worker threads. A sink must copy data synchronously,

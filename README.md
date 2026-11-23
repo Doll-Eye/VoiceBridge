@@ -21,7 +21,7 @@ If Windows is set to start NVDA automatically after sign-in, VoiceBridge gives i
 ## Status
 
 - The controller front end serves NVDA's `NvdaController` and `NvdaController3` interfaces, steps aside for NVDA and comes back when NVDA quits. It passed silent tests on Windows 11 with GTA11Y Revo's 64-bit Tolk DLL, NV Access's controller client, PRISM 0.18.3, and 32-bit and 64-bit test clients. [Handover and sign-in tests](tests/front/run.ps1)
-- **Being written:** the voice. The aims are to start speaking within about 30 milliseconds, to interrupt at once, to cut the silence natural voices put at the start of every phrase (about 110 milliseconds), and to keep recent phrases in memory.
+- The voice speaks through SAPI and WASAPI. It cuts the silence natural voices put at the start of every phrase (about 110 milliseconds) down to 15 milliseconds, stops at once when interrupted, and keeps recent phrases in memory. If the voice engine hangs or crashes, the supervisor starts a new server, which speaks each phrase that was still waiting once. It passed silent tests on Windows 11 with Jenny and the classic David voice, including forced hangs and crashes. [Voice tests](tests/voice/speaker-test.cpp)
 - **Not yet tried:** an installed trial with real games.
 
 `NvdaController2` (SSML speech and NVDA's process ID) is not served yet.
@@ -84,7 +84,7 @@ On the Windows machine itself, `VoiceBridge.exe --stop` stops a running VoiceBri
 
 ## Tests
 
-`tests/front/run-on-puck.sh` builds the silent version and runs the front end's tests on the Windows machine over ssh. The tests make no sound and show nothing, and the script removes everything it copied when it ends. It uses the Tolk and NVDA controller client DLLs from GTA11Y Revo, PRISM 0.18.3 and an ssh helper from folders next to this one.
+`tests/front/run-on-puck.sh` builds the silent front tests and runs them on the Windows machine over SSH. The full run also tests supervisor recovery with natural Jenny, sending its audio to a null output. The runner waits for games to close, runs in session zero and removes the files it copied. The compatibility tests use the Tolk and NVDA controller client DLLs from GTA11Y Revo and PRISM 0.18.3 from the D4 Assist checkout.
 
 ## Licence
 

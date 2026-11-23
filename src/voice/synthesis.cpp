@@ -120,17 +120,10 @@ struct Selection {
 
 HRESULT SelectVoices(const SpeakerConfig& config, const Settings& settings,
                      const std::vector<std::wstring>& excluded, std::vector<Selection>& choices) {
-    ComPtr<ISpObjectTokenCategory> category;
-    HRESULT hr = CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_ISpObjectTokenCategory, category.voidOut());
-    if (SUCCEEDED(hr)) hr = category->SetId(SPCAT_VOICES, FALSE);
-    if (FAILED(hr)) return hr;
-
-    wchar_t* defaultId = nullptr;
-    category->GetDefaultTokenId(&defaultId);
-    const std::wstring defaultKey = defaultId ? defaultId : L"";
-    CoTaskMemFree(defaultId);
-
+    std::wstring defaultKey;
+#ifdef VB_VOICE_TEST
+    const bool jennyOnly = test::Flag("VOICEBRIDGE_TEST_ONLY_JENNY");
+#endif
     const auto narrator = config.followNarrator ? Normalize(settings.narratorVoice) : std::wstring{};
     const auto wanted = Normalize(config.voice);
     const auto fallback = Normalize(config.fallbackVoice);
@@ -142,6 +135,9 @@ HRESULT SelectVoices(const SpeakerConfig& config, const Settings& settings,
         foundDefault = foundDefault || isDefault;
         auto name = Description(*token.get());
         const auto normalized = Normalize(name);
+#ifdef VB_VOICE_TEST
+        if (jennyOnly && normalized.find(L"microsoftjennynatural") != 0) return;
+#endif
         int rank = 4;
         if (!narrator.empty() && normalized == narrator) rank = 0;
         else if (!wanted.empty() && normalized.find(wanted) != std::wstring::npos) rank = 1;
@@ -156,6 +152,34 @@ HRESULT SelectVoices(const SpeakerConfig& config, const Settings& settings,
         const int rate = std::clamp(config.followNarrator && speed >= 0 ? speed - 10 : config.rate, -10, 10);
         choices.push_back({std::move(token), {std::move(id), std::move(name), {}, rate, rank >= 2, priority}});
     };
+    auto openToken = [](const wchar_t* id, ComPtr<ISpObjectToken>& token) {
+        HRESULT hr = CoCreateInstance(CLSID_SpObjectToken, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_ISpObjectToken, token.voidOut());
+        if (SUCCEEDED(hr)) hr = token->SetId(SPCAT_VOICES, id, FALSE);
+        return hr;
+    };
+#ifdef VB_VOICE_TEST
+    if (test::Flag("VOICEBRIDGE_TEST_ONLY_DAVID")) {
+        // Category enumeration can invoke the adapter's token enumerator, even if its voices are ignored.
+        ComPtr<ISpObjectToken> token;
+        const HRESULT hr = openToken(
+            L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_DAVID_11.0", token);
+        if (FAILED(hr)) return hr;
+        add(std::move(token));
+        return choices.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND) : S_OK;
+    }
+#endif
+    ComPtr<ISpObjectTokenCategory> category;
+    HRESULT hr = CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_ISpObjectTokenCategory, category.voidOut());
+    if (SUCCEEDED(hr)) hr = category->SetId(SPCAT_VOICES, FALSE);
+    if (FAILED(hr)) return hr;
+
+    wchar_t* defaultId = nullptr;
+    category->GetDefaultTokenId(&defaultId);
+    if (defaultId) defaultKey = defaultId;
+    CoTaskMemFree(defaultId);
+
     ComPtr<IEnumSpObjectTokens> tokens;
     hr = category->EnumTokens(nullptr, nullptr, tokens.out());
     while (SUCCEEDED(hr) && tokens) {
@@ -166,9 +190,7 @@ HRESULT SelectVoices(const SpeakerConfig& config, const Settings& settings,
     }
     if (!foundDefault && !defaultKey.empty()) {
         ComPtr<ISpObjectToken> token;
-        if (SUCCEEDED(CoCreateInstance(CLSID_SpObjectToken, nullptr, CLSCTX_INPROC_SERVER,
-                                       IID_ISpObjectToken, token.voidOut())) &&
-            SUCCEEDED(token->SetId(SPCAT_VOICES, defaultKey.c_str(), FALSE))) {
+        if (SUCCEEDED(openToken(defaultKey.c_str(), token))) {
             add(std::move(token));
         }
     }
@@ -397,6 +419,7 @@ struct Slot {
     Event wake;
     std::atomic<bool> abandoned{false};
     std::atomic<bool> exited{false};
+    Time retiredDeadline = NoDeadline;  // Scheduler-owned deadline for COM teardown.
     std::vector<std::wstring> excluded;  // Fixed at worker creation.
     unsigned excludedRevision = 0;
     std::atomic<Time> callAt{NoDeadline};
@@ -412,7 +435,7 @@ struct Slot {
     std::shared_ptr<Job> job;
     bool done = false;
     bool probePreferred = false;
-    bool purgeRequested = false;
+    Time cancelDeadline = NoDeadline;  // Scheduler-owned, independent of late SAPI callbacks.
     bool failed = false;
     HRESULT error = S_OK;
     std::shared_ptr<CachePcm> complete;
@@ -706,10 +729,96 @@ private:
     ComPtr<IUnknown> marshaler_;
 };
 
+// SAPI voices are found, created and released by one worker at a time.
+// Speech itself still runs on both workers at once. When two workers did
+// these steps together, the process sometimes died, with Microsoft David as
+// well as natural Jenny: a fail-fast (0xC0000409) while one worker unloaded
+// the voice's language library as the other loaded it, and heap damage that
+// the speech engine found while two workers released their voices.
+// Only the operation that actually entered SAPI has a running call timer.
+// A retired holder may still be on the stack when its replacement finishes.
+class VoiceLifecycle {
+public:
+    VoiceLifecycle(State& state, Slot& slot) : slot_(slot) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (owner_) {
+            const auto deadline = owner_->deadline_;
+            if (deadline == NoDeadline) {
+                changed_.wait(lock);
+            } else if (Clock::now() < deadline) {
+                changed_.wait_until(lock, deadline);
+            } else {
+                // The holder was retired. Only this outstanding operation is
+                // left behind. Every subsequent operation joins the new owner.
+                const bool cleanupTimeout = !owner_->watchdogReported_;
+                owner_ = nullptr;
+                if (cleanupTimeout) {
+                    lock.unlock();
+                    state.report(LogLevel::Error, L"A retired SAPI worker timed out during voice cleanup.");
+                    lock.lock();
+                }
+            }
+        }
+        owner_ = this;
+        entered_ = Clock::now();
+        if (slot_.abandoned) deadline_ = entered_ + CleanupGrace;
+        timer_.emplace(state, slot);
+        lock.unlock();
+#ifdef VB_VOICE_TEST
+        test::Observe({test::Kind::LifecycleEntered});
+        if (test::Flag("VOICEBRIDGE_TEST_LIFECYCLE_DELAY")) Sleep(25);
+#endif
+    }
+    ~VoiceLifecycle() {
+        std::lock_guard<std::mutex> lock(mutex_);
+#ifdef VB_VOICE_TEST
+        test::Observe({test::Kind::LifecycleLeft});
+#endif
+        if (owner_ == this) owner_ = nullptr;
+        changed_.notify_all();
+    }
+    VoiceLifecycle(const VoiceLifecycle&) = delete;
+    VoiceLifecycle& operator=(const VoiceLifecycle&) = delete;
+
+    static void retire(Slot& slot, bool timedOut) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slot.abandoned = true;
+        if (owner_ && &owner_->slot_ == &slot) {
+            owner_->watchdogReported_ = timedOut;
+            // A watchdog has already proved this call stuck. Other retirements
+            // still allow an ordinary Release to finish under the same lease.
+            owner_->deadline_ = timedOut ? Clock::now() : owner_->entered_ + CleanupGrace;
+            changed_.notify_all();
+        }
+    }
+private:
+    static constexpr auto CleanupGrace = 2s;
+    static inline std::mutex mutex_;
+    static inline std::condition_variable changed_;
+    static inline VoiceLifecycle* owner_ = nullptr;
+    Slot& slot_;
+    Time entered_{}, deadline_ = NoDeadline;
+    bool watchdogReported_ = false;
+    std::optional<CallTimer> timer_;
+};
+
 class Engine {
 public:
     Engine(const std::shared_ptr<State>& state, const std::shared_ptr<Slot>& slot)
         : stateOwner_(state), slotOwner_(slot), state_(*state), slot_(*slot) {}
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+    ~Engine() {
+        if (!voice_) return;
+        VoiceLifecycle lifecycle(state_, slot_);
+#ifdef VB_VOICE_TEST
+        if (stallRelease_) {
+            test::Observe({test::Kind::ReleaseStalled});
+            InjectStall(state_, true);
+        }
+#endif
+        voice_.reset();
+    }
     HRESULT configure(const Settings& settings, const std::vector<std::wstring>& excluded) {
 #ifdef VB_VOICE_TEST
         const bool badJenny = test::Flag("VOICEBRIDGE_TEST_BAD_JENNY");
@@ -721,11 +830,14 @@ public:
         std::vector<Selection> choices;
         HRESULT result;
         {
-            CallTimer timer(state_, slot_);
+            VoiceLifecycle lifecycle(state_, slot_);
+            if (!Live(state_, slot_, {})) return S_FALSE;
 #ifdef VB_VOICE_TEST
-            static std::atomic<bool> stalledSetup{false};
-            if (test::Flag("VOICEBRIDGE_TEST_CALL_STALL") && !stalledSetup.exchange(true))
+            static std::atomic<bool> heldLifecycle{false};
+            if (test::Flag("VOICEBRIDGE_TEST_LIFECYCLE_STALL") && !heldLifecycle.exchange(true)) {
                 InjectStall(state_, true);
+                if (!Live(state_, slot_, {})) return S_FALSE;
+            }
 #endif
             result = SelectVoices(state_.config, settings, excluded, choices);
         }
@@ -742,7 +854,11 @@ public:
             const bool warm = !voice_ || _wcsicmp(selected.choice.id.c_str(), choice_.id.c_str()) != 0;
             bool fallbackFormat = false;
             {
-                CallTimer timer(state_, slot_);
+                VoiceLifecycle lifecycle(state_, slot_);
+                if (!Live(state_, slot_, {})) {
+                    result = S_FALSE;
+                    break;
+                }
                 result = S_OK;
                 if (warm) {
 #ifdef VB_VOICE_TEST
@@ -785,12 +901,12 @@ public:
             state_.report(LogLevel::Error, L"SAPI failed (" + code + L").", key.c_str());
             rejected = true;
             {
-                CallTimer timer(state_, slot_);
+                VoiceLifecycle lifecycle(state_, slot_);
                 voice_.reset();
             }
         }
         {
-            CallTimer timer(state_, slot_);
+            VoiceLifecycle lifecycle(state_, slot_);
             choices.clear();
         }
         return result;
@@ -813,7 +929,15 @@ public:
             if (job) {
                 static std::atomic<bool> hung{false};
                 const bool oldTest = test::Flag("VOICEBRIDGE_TEST_HANG") && !hung.exchange(true);
-                InjectStall(state_, oldTest);
+                wchar_t marker[256]{};
+                const auto count = GetEnvironmentVariableW(L"VOICEBRIDGE_TEST_STALL_TEXT", marker, std::size(marker));
+                const bool poisoned = count && count < std::size(marker) && job->text == marker;
+                static std::atomic<bool> releaseTestStarted{false};
+                if (test::Flag("VOICEBRIDGE_TEST_RELEASE_STALL") && !releaseTestStarted.exchange(true)) {
+                    stallRelease_ = true;
+                    return E_FAIL;
+                }
+                InjectStall(state_, oldTest || poisoned);
                 if (!Live(state_, slot_, job)) return S_FALSE;
                 if (test::Flag("VOICEBRIDGE_TEST_FAIL_JENNY") &&
                     Normalize(choice_.name).find(L"jenny") != std::wstring::npos) return E_FAIL;
@@ -912,10 +1036,18 @@ private:
     Slot& slot_;
     Choice choice_;
     ComPtr<ISpVoice> voice_;
+#ifdef VB_VOICE_TEST
+    bool stallRelease_ = false;
+#endif
 };
 
 void Worker(const std::shared_ptr<State>& state, const std::shared_ptr<Slot>& slot) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#ifdef VB_VOICE_TEST
+    static std::atomic<bool> stalledSetup{false};
+    if (test::Flag("VOICEBRIDGE_TEST_CALL_STALL") && !stalledSetup.exchange(true))
+        InjectStall(*state, true);
+#endif
     ComApartment com(COINIT_MULTITHREADED);
     slot->callAt = NoDeadline;
     if (FAILED(com.result)) {
@@ -1000,7 +1132,7 @@ public:
             discardedJobs.swap(state_->retiredJobs);
             for (auto& channel : slots_) {
                 if (!channel.slot) continue;
-                channel.slot->abandoned = true;
+                VoiceLifecycle::retire(*channel.slot, false);
                 channel.slot->wake.signal();
             }
             state_->space.notify_all();
@@ -1036,7 +1168,7 @@ public:
             std::shared_ptr<Job> pending;
             std::shared_ptr<Job> dispatched;
             std::vector<HRESULT> errors;
-            bool abandoned = false;
+            unsigned abandoned = 0;
             std::optional<Choice> newChoice;
             {
                 std::lock_guard<std::mutex> lock(state_->mutex);
@@ -1079,8 +1211,20 @@ public:
             retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
                 [](const auto& slot) { return slot->exited.load(); }), retired_.end());
             for (auto& channel : slots_) start(channel, now, next, errors);
-            if (abandoned) state_->report(LogLevel::Error,
-                L"A SAPI voice timed out and was abandoned. Recovery is pending.", L"voice-timeout");
+            for (unsigned i = 0; i < abandoned; ++i)
+                state_->report(LogLevel::Error, L"A SAPI voice timed out and was abandoned. Recovery is pending.");
+            if (state_->exhausted && retired_.size() == MaxWorkers) {
+                const auto latest = (*std::max_element(retired_.begin(), retired_.end(),
+                    [](const auto& a, const auto& b) { return a->retiredDeadline < b->retiredDeadline; }))->retiredDeadline;
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                if (!state_->stop && !state_->jobs.empty()) {
+                    if (now < latest) next = std::min(next, latest);
+                    else if (std::none_of(retired_.begin(), retired_.end(), [](const auto& slot) { return slot->exited.load(); })) {
+                        SetEvent(state_->exhausted);
+                        return;
+                    }
+                }
+            }
             for (HRESULT hr : errors) {
                 const auto key = L"sapi-" + ErrorCode(hr);
                 state_->report(LogLevel::Error, L"SAPI failed (" + ErrorCode(hr) + L").", key.c_str());
@@ -1105,6 +1249,7 @@ public:
     }
 
 private:
+    static constexpr size_t MaxWorkers = 4;
     struct Channel {
         std::shared_ptr<Slot> slot;
         Time restart{};
@@ -1137,16 +1282,22 @@ private:
     }
 
     void inspect(Channel& channel, Time now, Time& next,
-                 std::vector<HRESULT>& errors, bool& abandoned) {
+                 std::vector<HRESULT>& errors, unsigned& abandoned) {
         if (channel.slot) {
             auto& slot = *channel.slot;
-            const Time first = slot.firstDeadline;
+            if (slot.job && slot.job->generation != state_->generation && slot.cancelDeadline == NoDeadline) {
+                slot.cancelDeadline = now + 3s;
+                slot.wake.signal();
+            }
             const Time call = slot.callAt;
-            const Time deadline = std::min({first, slot.progressDeadline.load(),
-                                            call == NoDeadline ? NoDeadline : call + 10s});
+            const Time callDeadline = call == NoDeadline ? NoDeadline : call + 10s;
+            const Time deadline = slot.cancelDeadline == NoDeadline
+                ? std::min({slot.firstDeadline.load(), slot.progressDeadline.load(), callDeadline})
+                : std::min(slot.cancelDeadline, callDeadline);
 
             if (slot.done) {
                 auto job = std::move(slot.job);
+                if (!job->bufferedFrames) state_->retire(*job);  // Includes successful silence.
                 if (slot.complete) candidates_.push_back({job, std::move(slot.complete)});
                 if (state_->active == job) {
                     if (slot.error == S_OK) {
@@ -1160,26 +1311,32 @@ private:
                 }
                 slot.error = S_OK;
                 slot.done = false;
-                slot.purgeRequested = false;
+                slot.cancelDeadline = NoDeadline;
                 slot.firstDeadline = NoDeadline;
                 slot.progressDeadline = NoDeadline;
                 slot.wake.signal();
             } else if (slot.failed || now >= deadline) {
                 if (slot.failed) errors.push_back(slot.error);
                 else {
-                    abandoned = true;
+                    ++abandoned;
 #ifdef VB_VOICE_TEST
                     test::Observe({test::Kind::Abandoned, slot.job ? slot.job->id : 0});
 #endif
                 }
                 if (slot.job && state_->active == slot.job) {
                     // A retry is safe only before anything has reached the output queues.
+                    // Three blocked attempts still leave one worker for the next phrase,
+                    // even if each attempt used a different local voice token.
+                    constexpr unsigned maxRetries = 2;
                     if (!slot.job->published &&
-                        (!slot.failed || ++slot.job->failedTokens[slot.attemptedId] <= 2))
+                        ++slot.job->failedTokens[slot.attemptedId] <= maxRetries &&
+                        (slot.failed || ++slot.job->timeouts <= maxRetries))
                         state_->jobs.push_front(slot.job);
+                    else if (!slot.job->bufferedFrames) state_->retire(*slot.job);
                     state_->active.reset();
                 }
-                slot.abandoned = true;
+                slot.retiredDeadline = slot.failed ? now + 10s : now;
+                VoiceLifecycle::retire(slot, !slot.failed);
                 slot.wake.signal();
                 state_->space.notify_all();
                 channel.restart = slot.failed ? now + 1s : now;
@@ -1192,13 +1349,6 @@ private:
                 retired_.push_back(std::move(channel.slot));
             } else {
                 next = std::min(next, deadline);
-                if (slot.job && slot.job->generation != state_->generation && !slot.purgeRequested) {
-                    slot.purgeRequested = true;
-                    slot.firstDeadline = NoDeadline;
-                    slot.progressDeadline = now + 10s;
-                    next = std::min(next, slot.progressDeadline.load());
-                    slot.wake.signal();
-                }
             }
         }
         if (channel.slot && channel.slot->revision != revision_) {
@@ -1213,7 +1363,7 @@ private:
         // An in-process COM call cannot safely be killed. Keep at most four
         // workers, including any still inside Release or CoUninitialize.
         const size_t active = (slots_[0].slot ? 1U : 0U) + (slots_[1].slot ? 1U : 0U);
-        if (retired_.size() + active >= 4) return;
+        if (retired_.size() + active >= MaxWorkers) return;
         if (now < channel.restart) {
             next = std::min(next, channel.restart);
             return;
@@ -1273,6 +1423,7 @@ private:
         if (cached) {
             const auto frames = cached->size() / choice_->format.channels;
             if (state_->waiting + choice_->format.seconds(frames) > BufferSeconds) return {};
+            state_->beginReplay(*job);
             state_->jobs.pop_front();
 #ifdef VB_VOICE_TEST
             test::Observe({test::Kind::CacheHit, job->id, job->generation});
@@ -1288,6 +1439,7 @@ private:
         for (int index : {preferred, 1 - preferred}) {
             auto* slot = slots_[index].slot.get();
             if (!slot || slot->job || slot->readyRevision != revision_ || slot->choice.id != choice_->id) continue;
+            state_->beginReplay(*job);
             state_->jobs.pop_front();
             state_->active = slot->job = job;
             slot->firstDeadline = Clock::now() + 2s;

@@ -4,10 +4,12 @@
 
 #include <cwchar>
 
-inline constexpr wchar_t TestDirectory[] = LR"(C:\VoiceBridge-test\front\)";
-
 inline std::wstring TestPath(const wchar_t* image) {
-    return std::wstring(TestDirectory) + image;
+    wchar_t directory[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"VOICEBRIDGE_FRONT_TEST_DIRECTORY", directory, MAX_PATH);
+    if (length >= MAX_PATH) return {};
+    const auto root = length ? std::wstring(directory, length) : LR"(C:\VoiceBridge-test\front)";
+    return root + L'\\' + image;
 }
 
 inline bool IsTestProcess(HANDLE process, const wchar_t* image) {

@@ -22,6 +22,7 @@ struct Child {
 
 Child Start(const wchar_t* program, const wchar_t* arguments) {
     const auto path = TestPath(program);
+    Require(!path.empty(), "expected a valid fixture path");
     auto command = L"\"" + path + L"\" " + arguments;
     PROCESS_INFORMATION process{};
     STARTUPINFOW startup{};
