@@ -42,6 +42,8 @@ void CheckDefaults(const vb::Settings& settings) {
     Require(!settings.logText, "text logging off by default");
     const std::vector<std::wstring> defaultNames{L"nvda.exe", L"nvda_uiAccess.exe", L"nvda_noUIAccess.exe"};
     Require(settings.nvdaNames == defaultNames, "default NVDA process names");
+    Require(settings.signInWaitSeconds == 120, "default NVDA sign-in wait");
+    Require(settings.startsAtSignIn == vb::SignInStart::Auto, "default NVDA sign-in detection");
 }
 
 void CheckValid(const vb::Settings& settings) {
@@ -57,6 +59,8 @@ void CheckValid(const vb::Settings& settings) {
     Require(settings.logText, "explicit text logging opt-in");
     const std::vector<std::wstring> names{L"test NVDA.exe", L"second.exe"};
     Require(settings.nvdaNames == names, "trimmed process names with spaces and an invalid token");
+    Require(settings.signInWaitSeconds == 600, "maximum NVDA sign-in wait");
+    Require(settings.startsAtSignIn == vb::SignInStart::Yes, "case-insensitive NVDA sign-in override yes");
 }
 }
 
@@ -79,6 +83,8 @@ level=unknown
 text=01
 [nvda]
 processNames=C:\invalid\nvda.exe;VoiceBridge.EXE
+signInWaitSeconds=601
+startsAtSignIn=true
 )ini"));
         CheckValid(ReadFixture(directory.path / L"Valid values", R"ini(
 [voice]
@@ -96,7 +102,27 @@ level=DEBUG
 text=1
 [nvda]
 processNames= test NVDA.exe ; bad*.exe ; second.exe
+signInWaitSeconds=600
+startsAtSignIn=yEs
 )ini"));
+        const auto disabled = ReadFixture(directory.path / L"Disabled sign-in wait",
+            "[nvda]\nsignInWaitSeconds=0\nstartsAtSignIn=nO\n");
+        Require(disabled.signInWaitSeconds == 0, "zero disables the NVDA sign-in wait");
+        Require(disabled.startsAtSignIn == vb::SignInStart::No, "case-insensitive NVDA sign-in override no");
+        CheckDefaults(ReadFixture(directory.path / L"Negative sign-in wait",
+            "[nvda]\nsignInWaitSeconds=-1\nstartsAtSignIn=aUtO\n"));
+        CheckDefaults(ReadFixture(directory.path / L"Malformed sign-in wait",
+            "[nvda]\nsignInWaitSeconds=3seconds\nstartsAtSignIn=\n"));
+        Require(vb::NvdaInAccessibilityConfiguration(L"nvda_nvda_v1"), "single NVDA accessibility entry");
+        Require(vb::NvdaInAccessibilityConfiguration(L"narrator, \tNvDa_NVDA_v1 \t,,magnifier"),
+            "NVDA accessibility entry among other entries, with mixed case and spaces");
+        Require(vb::NvdaInAccessibilityConfiguration(std::wstring(32768, L'x') + L",nvda_nvda_v1"),
+            "NVDA accessibility entry after a long list prefix");
+        Require(!vb::NvdaInAccessibilityConfiguration(L""), "empty accessibility configuration");
+        Require(!vb::NvdaInAccessibilityConfiguration(L"narrator,xnvda_nvda_v1,nvda_nvda_v10,nvda_nvda_v1;magnifier"),
+            "NVDA accessibility entry must be a complete comma-separated token");
         fputs("Missing and malformed INI values use the defaults. Valid INI values and explicit text opt-in are read from a path with spaces.\n", result);
+        fputs("The NVDA sign-in wait accepts 0 to 600 seconds and case-insensitive overrides. Invalid values use the defaults.\n", result);
+        fputs("Accessibility configuration matching accepts full NVDA entries without touching the registry.\n", result);
     });
 }

@@ -76,7 +76,9 @@ function Uninstall-Bridge {
 }
 
 function Confirm-Launch([datetime]$launched) {
-    $pattern = '^(?<stamp>\S+ \S+) (?<id>\d+) (?<role>server|supervisor) info (Serving NvdaCtlr\.(?<session>\d+)\..+|Waiting for NVDA process (?<nvda>\d+))$'
+    $pattern = '^(?<stamp>\S+ \S+) (?<id>\d+) (?<role>server|supervisor) info (' +
+        'Serving NvdaCtlr\.(?<session>\d+)\..+|Waiting for NVDA process (?<nvda>\d+)|' +
+        'Sign-in wait: waiting up to (?<wait>\d+) ms for NVDA(?: \([^)]+\))*)$'
     for ($i = 0; $i -lt 40; $i++) {
         $lines = @(foreach ($path in "$log.old", $log) {
             Get-Content -Encoding UTF8 -LiteralPath $path -Tail 40 -ErrorAction SilentlyContinue
@@ -95,6 +97,11 @@ function Confirm-Launch([datetime]$launched) {
                 if (!$process) { continue }
                 if ($Matches.role -eq 'server' -and $Matches.session -eq $process.SessionId) {
                     $lines[$j]
+                    return
+                }
+                if ($Matches.role -eq 'supervisor' -and $Matches.wait -and
+                        (Get-Date) -lt $stamp.AddMilliseconds([int]$Matches.wait)) {
+                    'VoiceBridge started and is giving NVDA time to start after sign-in.'
                     return
                 }
                 if ($Matches.role -eq 'supervisor' -and $Matches.nvda) {

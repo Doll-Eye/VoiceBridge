@@ -4,11 +4,11 @@ cd "$(dirname "$0")/../.."
 mode="${1:-full}"
 case "$mode" in rpc|full) ;; *) echo "Usage: $0 [rpc|full]" >&2; exit 2 ;; esac
 SPEAKER=log ./build.sh tests
-files=(build/{VoiceBridge,stock,prism-client}.exe
-    ../gta11y-revo/final/nvdaControllerClient64.dll
+files=(build/{VoiceBridge,stock,prism-client,lifecycle,tolk-client}.exe
+    ../gta11y-revo/final/{nvdaControllerClient64,Tolk}.dll
     ../d4-assist-fork/third_party/prism/prism.dll tests/front/run.ps1)
 if [[ "$mode" == full ]]; then
-    files+=(build/{client64,client32,lifecycle,vb-fake-nvda,stuck-bridge,settings-test}.exe tests/front/log-settings.ps1 tools/install.ps1)
+    files+=(build/{client64,client32,vb-fake-nvda,stuck-bridge,settings-test,signin-bridge}.exe tests/front/log-settings.ps1 tools/install.ps1)
 fi
 for file in "${files[@]}"; do
     [[ -f "$file" ]] || { echo "Missing $file" >&2; exit 1; }

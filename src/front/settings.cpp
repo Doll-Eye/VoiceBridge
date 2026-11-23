@@ -84,6 +84,51 @@ Settings ReadSettings(const std::filesystem::path& directory) {
 
     settings.nvdaNames = ProcessNames(ini.String(L"nvda", L"processNames", DefaultNvdaNames));
     if (settings.nvdaNames.empty()) settings.nvdaNames = ProcessNames(DefaultNvdaNames);
+    settings.signInWaitSeconds = ini.Integer(L"nvda", L"signInWaitSeconds", settings.signInWaitSeconds, 0, 600);
+    const auto startsAtSignIn = ini.String(L"nvda", L"startsAtSignIn", L"auto");
+    if (_wcsicmp(startsAtSignIn.c_str(), L"yes") == 0) {
+        settings.startsAtSignIn = SignInStart::Yes;
+    } else if (_wcsicmp(startsAtSignIn.c_str(), L"no") == 0) {
+        settings.startsAtSignIn = SignInStart::No;
+    }
     return settings;
+}
+
+bool NvdaInAccessibilityConfiguration(std::wstring_view configuration) {
+    constexpr std::wstring_view nvdaId = L"nvda_nvda_v1";
+    for (;;) {
+        const auto comma = configuration.find(L',');
+        const auto token = configuration.substr(0, comma);
+        const auto first = token.find_first_not_of(L" \t");
+        if (first != std::wstring_view::npos) {
+            const auto name = token.substr(first, token.find_last_not_of(L" \t") - first + 1);
+            if (name.size() == nvdaId.size() && CompareStringOrdinal(
+                    name.data(), static_cast<int>(name.size()), nvdaId.data(),
+                    static_cast<int>(nvdaId.size()), TRUE) == CSTR_EQUAL) {
+                return true;
+            }
+        }
+        if (comma == std::wstring_view::npos) return false;
+        configuration.remove_prefix(comma + 1);
+    }
+}
+
+std::optional<bool> NvdaConfiguredAtSignIn() {
+    constexpr auto key = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Accessibility";
+    constexpr DWORD flags = RRF_RT_REG_SZ | RRF_NOEXPAND;
+    DWORD bytes = 0;
+    auto status = RegGetValueW(HKEY_CURRENT_USER, key, L"Configuration", flags, nullptr, nullptr, &bytes);
+    while (status == ERROR_SUCCESS || status == ERROR_MORE_DATA) {
+        if (bytes % sizeof(wchar_t) != 0 || bytes > MAXDWORD - sizeof(wchar_t)) return std::nullopt;
+        // Allow RegGetValueW to append a terminator if the value was stored without one.
+        std::wstring value(bytes / sizeof(wchar_t) + 1, L'\0');
+        const auto bufferBytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+        bytes = bufferBytes;
+        status = RegGetValueW(HKEY_CURRENT_USER, key, L"Configuration", flags, nullptr, value.data(), &bytes);
+        if (status == ERROR_SUCCESS) return NvdaInAccessibilityConfiguration(value.c_str());
+        if (status == ERROR_MORE_DATA && bytes <= bufferBytes) return std::nullopt;
+    }
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND || status == ERROR_UNSUPPORTED_TYPE) return false;
+    return std::nullopt;
 }
 }

@@ -6,6 +6,8 @@ try {
 [log]
 level=debug
 text=1invalid
+[nvda]
+startsAtSignIn=no
 '@ | Set-Content -LiteralPath $iniPath -Encoding ASCII
     $logPath = Join-Path $TestDirectory 'bridge.log'
     $seed = 'x' * (1MB - 11)

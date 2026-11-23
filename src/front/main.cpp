@@ -10,8 +10,6 @@
 namespace {
 using namespace vb;
 
-constexpr wchar_t WindowClass[] = L"VoiceBridge.ServerWindow";
-constexpr wchar_t WindowTitle[] = L"VoiceBridge";
 constexpr DWORD NvdaCheckMs = 500;
 
 [[noreturn]] void Finish(Log& log, UINT code) {
@@ -97,14 +95,41 @@ DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) 
     return code;
 }
 
+ULONGLONG SignInDeadline(const Settings& settings, Log& log) {
+    ULONGLONG remaining = 0;
+    std::wstring decision;
+    std::optional<bool> configured = settings.startsAtSignIn == SignInStart::Yes;
+    if (settings.signInWaitSeconds && settings.startsAtSignIn == SignInStart::Auto) {
+        configured = NvdaConfiguredAtSignIn();
+    }
+    if (!settings.signInWaitSeconds) {
+        decision = L"disabled by signInWaitSeconds=0";
+    } else if (!configured.value_or(true)) {
+        decision = settings.startsAtSignIn == SignInStart::No ? L"disabled by startsAtSignIn=no"
+                                                              : L"NVDA is not configured to start at sign-in";
+    } else {
+        const auto age = LogonAgeMs();
+        const auto limit = static_cast<ULONGLONG>(settings.signInWaitSeconds) * 1000;
+        remaining = limit - std::min(age.value_or(0), limit);
+        decision = remaining ? L"waiting up to " + std::to_wstring(remaining) + L" ms for NVDA"
+                             : L"the configured wait since sign-in has elapsed";
+        if (!age) decision += L" (logon time unavailable)";
+        if (!configured.has_value()) decision += L" (sign-in setting unreadable)";
+    }
+    log.Write(LogLevel::Info, L"Sign-in wait: " + decision);
+    return GetTickCount64() + remaining;
+}
+
 [[noreturn]] void Supervise(HANDLE stop, const Settings& settings,
                             const std::filesystem::path& executable, Log& log) {
     log.Write(LogLevel::Info, L"Started");
     DWORD backoff = 1000;
     DWORD waitingPid = 0;
+    auto signInDeadline = SignInDeadline(settings, log);
     while (!Stopping(stop)) {
         const auto nvda = FindNvda(settings, executable);
         if (nvda.pid) {
+            signInDeadline = 0;
             backoff = 1000;
             if (waitingPid != nvda.pid) {
                 log.Write(LogLevel::Info, L"Waiting for NVDA process " + std::to_wstring(nvda.pid));
@@ -127,6 +152,10 @@ DWORD RunServer(HANDLE stop, const std::filesystem::path& executable, Log& log) 
         waitingPid = 0;
         if (Stopping(stop)) break;
         const auto started = GetTickCount64();
+        if (started < signInDeadline) {
+            WaitForSingleObject(stop, static_cast<DWORD>(std::min<ULONGLONG>(signInDeadline - started, NvdaCheckMs)));
+            continue;
+        }
         {
             // Direct --serve and the supervisor share this one serving slot.
             const Handle slot(CreateMutexW(nullptr, TRUE, ServerMutex));
@@ -228,7 +257,7 @@ DWORD WINAPI ProbeController(void* endpoint) {
     if (const auto nvda = FindNvda(settings, executable); nvda.pid) {
         StandAside(log, L"NVDA process " + std::to_wstring(nvda.pid) + L" is running");
     }
-    if (FindWindowW(L"wxWindowClassNR", L"NVDA")) StandAside(log, L"the NVDA window already exists");
+    if (HasExternalNvdaWindow(executable)) StandAside(log, L"the NVDA window already exists");
     auto endpoint = EndpointName();
     if (endpoint.empty()) Fail(log, L"Could not obtain the desktop endpoint", ERROR_INVALID_NAME);
     const Handle probe(CreateThread(nullptr, 0, ProbeController, &endpoint, 0, nullptr));
@@ -257,9 +286,9 @@ DWORD WINAPI ProbeController(void* endpoint) {
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProcedure;
     windowClass.hInstance = instance;
-    windowClass.lpszClassName = WindowClass;
+    windowClass.lpszClassName = NvdaWindowClass;
     if (!RegisterClassW(&windowClass)) Fail(log, L"Could not register the VoiceBridge window class", GetLastError());
-    if (!CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WindowClass, WindowTitle, WS_POPUP,
+    if (!CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, NvdaWindowClass, NvdaWindowTitle, WS_POPUP,
                          0, 0, 0, 0, nullptr, nullptr, instance, nullptr)) {
         Fail(log, L"Could not create the VoiceBridge window", GetLastError());
     }
@@ -282,7 +311,7 @@ DWORD WINAPI ProbeController(void* endpoint) {
 
         auto now = GetTickCount64();
         if (now >= nextScan) {
-            if (const auto nvda = FindNvda(settings, executable); nvda.pid) {
+            if (const auto nvda = FindNvda(settings, executable, true); nvda.pid) {
                 StopServing(startup, L"NVDA process " + std::to_wstring(nvda.pid) + L" appeared");
             }
             nextScan = now + NvdaCheckMs;

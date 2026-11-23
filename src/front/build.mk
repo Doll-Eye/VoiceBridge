@@ -7,6 +7,7 @@ CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -MMD -MP
 CPPFLAGS := -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX
 GUI := -static -mwindows -municode
 RPC := -lrpcrt4 -ladvapi32 -luser32
+BRIDGE_LIBS := -lshell32 -lsecur32
 
 ifeq ($(SPEAKER),log)
 SPEAKER_SOURCES := $(FRONT)/log_speaker.cpp
@@ -32,7 +33,7 @@ $(BUILD)/speaker-mode: FORCE
 	@if [ "$$(cat $@ 2>/dev/null)" != "$(SPEAKER)" ]; then printf '%s\n' '$(SPEAKER)' > $@; fi
 
 $(BUILD)/VoiceBridge.exe: $(SERVER_OBJECTS) $(BUILD)/speaker-mode $(FRONT)/build.mk $(SPEAKER_LIBS_FILE)
-	$(TOOL64)-g++ $(GUI) -o $@ $(SERVER_OBJECTS) $(RPC) -lshell32 $(SPEAKER_LIBS)
+	$(TOOL64)-g++ $(GUI) -o $@ $(SERVER_OBJECTS) $(RPC) $(BRIDGE_LIBS) $(SPEAKER_LIBS)
 
 $(BUILD)/x64/front/ping.o: CXXFLAGS += -fno-exceptions -fno-reorder-blocks
 
@@ -80,23 +81,30 @@ $(BUILD)/client64.exe: $(CLIENT_DEPS) $(BUILD)/x64/controller_c.o
 $(BUILD)/client32.exe: $(CLIENT_DEPS) $(BUILD)/x86/controller_c.o
 	$(TOOL32)-g++ $(TEST_FLAGS) -iquote $(FRONT) -I$(BUILD)/x86 -o $@ $< $(TEST_RPC) $(BUILD)/x86/controller_c.o $(RPC)
 
-$(BUILD)/lifecycle.exe: $(TEST)/lifecycle.cpp $(TEST)/test.h $(FRONT)/controller_rpc.h $(FRONT)/handle.h $(FRONT)/build.mk \
+$(BUILD)/lifecycle.exe: $(TEST)/lifecycle.cpp $(TEST)/test-process.h $(TEST)/test.h $(FRONT)/controller_rpc.h $(FRONT)/handle.h $(FRONT)/build.mk \
 	$(BUILD)/x64/controller_c.o $(BUILD)/x64/controller_s.o \
 	$(addprefix $(BUILD)/x64/front/,rpc.o rpc_alloc.o endpoint.o ping.o)
 	$(TOOL64)-g++ $(TEST_FLAGS) -iquote $(FRONT) -o $@ $< $(filter %.o,$^) $(RPC)
 
-$(BUILD)/vb-fake-nvda.exe: $(TEST)/fake.cpp $(TEST)/test.h $(FRONT)/build.mk
+$(BUILD)/vb-fake-nvda.exe: $(TEST)/fake.cpp $(TEST)/test-process.h $(TEST)/test.h $(FRONT)/handle.h $(FRONT)/build.mk
+	$(TOOL64)-g++ $(TEST_FLAGS) -iquote $(FRONT) -o $@ $< -luser32
+
+$(BUILD)/tolk-client.exe: $(TEST)/tolk.cpp $(TEST)/test.h $(FRONT)/build.mk
 	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $<
 
-tests: $(BUILD)/client64.exe $(BUILD)/client32.exe $(BUILD)/lifecycle.exe $(BUILD)/vb-fake-nvda.exe
+tests: $(BUILD)/client64.exe $(BUILD)/client32.exe $(BUILD)/lifecycle.exe $(BUILD)/vb-fake-nvda.exe $(BUILD)/tolk-client.exe
 
 ifeq ($(SPEAKER),log)
 # Silent fault injection uses the production front and a stalled test speaker.
 $(BUILD)/stuck-bridge.exe: $(TEST)/stuck-speaker.cpp $(filter-out $(BUILD)/x64/front/log_speaker.o,$(SERVER_OBJECTS)) $(FRONT)/build.mk
-	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^) $(RPC) -lshell32
+	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^) $(RPC) $(BRIDGE_LIBS)
 
 $(BUILD)/settings-test.exe: $(TEST)/settings-test.cpp $(TEST)/test.h $(BUILD)/x64/front/settings.o $(FRONT)/build.mk
 	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^)
 
-tests: $(BUILD)/stuck-bridge.exe $(BUILD)/settings-test.exe
+# Use the production supervisor and settings with a deterministic logon age.
+$(BUILD)/signin-bridge.exe: $(TEST)/test-logon.cpp $(FRONT)/process.h $(filter-out $(BUILD)/x64/front/logon.o,$(SERVER_OBJECTS)) $(FRONT)/build.mk
+	$(TOOL64)-g++ $(TEST_FLAGS) -o $@ $< $(filter %.o,$^) $(RPC) $(BRIDGE_LIBS)
+
+tests: $(BUILD)/stuck-bridge.exe $(BUILD)/settings-test.exe $(BUILD)/signin-bridge.exe
 endif

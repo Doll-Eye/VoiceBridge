@@ -1,11 +1,14 @@
 #pragma once
 #include "handle.h"
 #include "settings.h"
+#include <optional>
 
 namespace vb {
 inline constexpr wchar_t StopEventName[] = L"Local\\VoiceBridge.Stop";
 inline constexpr wchar_t SupervisorMutex[] = L"Local\\VoiceBridge.Supervisor";
 inline constexpr wchar_t ServerMutex[] = L"Local\\VoiceBridge.Server";
+inline constexpr wchar_t NvdaWindowClass[] = L"wxWindowClassNR";
+inline constexpr wchar_t NvdaWindowTitle[] = L"NVDA";
 
 struct NvdaProcess {
     DWORD pid = 0;
@@ -13,7 +16,10 @@ struct NvdaProcess {
 };
 
 std::filesystem::path ExecutablePath();
-NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& executable);
+std::optional<ULONGLONG> LogonAgeMs();
+bool HasExternalNvdaWindow(const std::filesystem::path& executable);
+NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& executable,
+                     bool serving = false);
 struct ServerProcess {
     Handle job;
     Handle stop;

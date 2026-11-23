@@ -1,6 +1,7 @@
 #include "process.h"
 
 #include <sddl.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <winternl.h>
 
@@ -36,6 +37,39 @@ bool SameName(std::wstring_view a, std::wstring_view b) {
             == CSTR_EQUAL;
 }
 
+// An NVDA status query exits after looking for the window. An accessibility
+// launch does the same if our worker already has the window. Dropping it on a
+// process scan before the launcher reaches FindWindow would change its answer.
+bool ExitsAfterWindowCheck(HANDLE process, bool serving) {
+    using Query = decltype(&NtQueryInformationProcess);
+    static const auto query = reinterpret_cast<Query>(reinterpret_cast<uintptr_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess")));
+    constexpr auto commandLineInfo = static_cast<PROCESSINFOCLASS>(60);
+    ULONG bytes = 0;
+    if (!query) return false;
+    query(process, commandLineInfo, nullptr, 0, &bytes);
+    if (bytes < sizeof(UNICODE_STRING) || bytes > sizeof(UNICODE_STRING) + 65536) return false;
+    std::vector<BYTE> buffer(bytes);
+    if (query(process, commandLineInfo, buffer.data(), bytes, &bytes) < 0) return false;
+    const auto& line = *reinterpret_cast<const UNICODE_STRING*>(buffer.data());
+    if (!line.Buffer || !line.Length) return false;
+    const std::wstring command(line.Buffer, line.Length / sizeof(wchar_t));
+    int count = 0;
+    auto argv = CommandLineToArgvW(command.c_str(), &count);
+    if (!argv) return false;
+    bool exits = false;
+    for (int i = 1; i < count; ++i) {
+        const std::wstring_view arg(argv[i]);
+        if (arg == L"--") break;
+        if (arg == L"--check-running" || arg == L"-k" || (serving && arg == L"--ease-of-access")) {
+            exits = true;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return exits;
+}
+
 template <class Visit>
 bool ScanBasicProcesses(Visit visit) {
     using Query = decltype(&NtQuerySystemInformation);
@@ -69,7 +103,21 @@ bool ScanBasicProcesses(Visit visit) {
 }
 }
 
-NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& executable) {
+bool HasExternalNvdaWindow(const std::filesystem::path& executable) {
+    HWND window = nullptr;
+    while ((window = FindWindowExW(nullptr, window, NvdaWindowClass, NvdaWindowTitle))) {
+        DWORD pid = 0;
+        if (!GetWindowThreadProcessId(window, &pid) || pid == GetCurrentProcessId()) continue;
+        const Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        wchar_t path[32768];
+        DWORD length = static_cast<DWORD>(std::size(path));
+        if (!process || !QueryFullProcessImageNameW(process.get(), 0, path, &length) ||
+            !SameName(std::wstring_view(path, length), executable.native())) return true;
+    }
+    return false;
+}
+
+NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& executable, bool serving) {
     if (settings.nvdaNames.empty()) return {};
     const DWORD self = GetCurrentProcessId();
     DWORD session = 0;
@@ -100,7 +148,9 @@ NvdaProcess FindNvda(const Settings& settings, const std::filesystem::path& exec
         }
         const std::wstring_view fullImage(path, length);
         if (!SameName(image, fullImage.substr(fullImage.find_last_of(L"\\/") + 1))) return false;
-        if (WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT) return false;
+        if (WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT || ExitsAfterWindowCheck(process.get(), serving)) {
+            return false;
+        }
         match = {pid, std::move(process)};
         return true;
     };

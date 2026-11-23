@@ -14,9 +14,13 @@ Built by a blind developer and an AI.
 - No game or mod files are changed.
 - The voice follows Narrator's chosen voice and speed, read from Narrator's settings, so you change them in Narrator. Narrator does not need to be running. If that voice cannot be reached through SAPI, VoiceBridge uses Jenny, then the default voice.
 
+While serving, VoiceBridge creates a hidden window with the class and title that Tolk looks for. The window never takes focus. When Windows starts NVDA automatically for accessibility, for example after the lock screen, NVDA sees this window and closes again, just as it does when NVDA is already running. Starting NVDA yourself, for example with Ctrl+Alt+N, always takes over. Tools that run `nvda --check-running` will be told that NVDA is running while VoiceBridge serves.
+
+If Windows is set to start NVDA automatically after sign-in, VoiceBridge gives it up to 120 seconds from sign-in to appear by default. If NVDA appears during that wait, VoiceBridge waits for it to quit before serving. Otherwise VoiceBridge starts serving when the wait ends. If Windows denies access to the sign-in setting, VoiceBridge gives NVDA the same time to start. If Windows cannot report when sign-in occurred, the wait starts when VoiceBridge starts.
+
 ## Status
 
-- **Done:** the controller front end. It serves NVDA's `NvdaController` and `NvdaController3` interfaces, steps aside for a real NVDA and comes back when NVDA quits. It has been tested silently on Windows 11 with NV Access's client DLL, PRISM 0.18.3, and 32-bit and 64-bit clients. The handover fixtures and performance measurements are described in the [front-end review](REVIEW-front.md).
+- The controller front end serves NVDA's `NvdaController` and `NvdaController3` interfaces, steps aside for NVDA and comes back when NVDA quits. It passed silent tests on Windows 11 with GTA11Y Revo's 64-bit Tolk DLL, NV Access's controller client, PRISM 0.18.3, and 32-bit and 64-bit test clients. [Handover and sign-in tests](tests/front/run.ps1)
 - **Being written:** the voice. The aims are to start speaking within about 30 milliseconds, to interrupt at once, to cut the silence natural voices put at the start of every phrase (about 110 milliseconds), and to keep recent phrases in memory.
 - **Not yet tried:** an installed trial with real games.
 
@@ -26,7 +30,7 @@ Built by a blind developer and an AI.
 
 The stock NVDA controller DLL and PRISM v0.18.3 discover the bridge over RPC. Programs that use these directly can send it speech.
 
-Upstream Tolk also requires a window with NVDA’s exact class and title. Games using that version of Tolk need real NVDA for its NVDA back end. VoiceBridge uses a different window identity because the Windows sign-in launcher for NVDA exits when it sees that window. [Tolk’s detection code](https://github.com/dkager/tolk/blob/e5149f0cb6ef9b941673017e0e7b7c409e485fbe/src/ScreenReaderDriverNVDA.cpp#L54-L57) · [NVDA’s sign-in check](https://github.com/nvaccess/nvda/blob/b896c9c44c86206b212a2d02bfeca0b1b2e80944/source/nvda.pyw#L140-L175)
+Games and mods using Tolk can speak through VoiceBridge when NV Access's controller client DLL is beside the game.
 
 ## Build
 
@@ -50,11 +54,11 @@ This makes `build/VoiceBridge.exe`, a static 64-bit Windows program. The default
 - **audio:** `keepAwakeSeconds` is how long the sound stream stays open after speech, so that an idle VoiceBridge does not keep the computer awake.
 - **cache:** `megabytes` is the size of the phrase cache; 0 turns it off.
 - **log:** `level` is error, info or debug. Spoken text is never written to the log unless `text=1`.
-- **nvda:** `processNames` lists NVDA's program names, so that VoiceBridge can tell when NVDA is running.
+- **nvda:** `processNames` lists NVDA's program names, so that VoiceBridge can tell when NVDA is running. `signInWaitSeconds` sets the number of seconds from sign-in to give NVDA to start. The range is 0 to 600, the default is 120, and 0 disables the wait. `startsAtSignIn=auto` reads the Windows sign-in setting. Use `yes` or `no` to override it for tests. Invalid values use the defaults.
 
 ## Install
 
-VoiceBridge runs as a scheduled task that starts 20 seconds after you sign in, in your own session, with ordinary rights. The delay lets an NVDA that starts at sign-in go first.
+VoiceBridge runs as a scheduled task that starts 20 seconds after you sign in, in your own session, with ordinary rights. The sign-in wait counts from when you signed in.
 
 The scripts in `tools/` install it from a Mac over ssh, into `%LOCALAPPDATA%\VoiceBridge`. They were written for one Windows handheld, reached over ssh as `puck`.
 
@@ -80,7 +84,7 @@ On the Windows machine itself, `VoiceBridge.exe --stop` stops a running VoiceBri
 
 ## Tests
 
-`tests/front/run-on-puck.sh` builds the silent version and runs the front end's tests on the Windows machine over ssh. The tests make no sound and show nothing, and the script removes everything it copied when it ends. For now it takes NV Access's controller client DLL, PRISM 0.18.3 and a small ssh helper from folders next to this one.
+`tests/front/run-on-puck.sh` builds the silent version and runs the front end's tests on the Windows machine over ssh. The tests make no sound and show nothing, and the script removes everything it copied when it ends. It uses the Tolk and NVDA controller client DLLs from GTA11Y Revo, PRISM 0.18.3 and an ssh helper from folders next to this one.
 
 ## Licence
 

@@ -1,6 +1,9 @@
 param([ValidateSet('rpc','full')] [string] $Mode, [string] $TestDirectory)
 $ErrorActionPreference = 'Stop'
 if ((Get-Process -Id $PID).SessionId -ne 0) { throw 'Expected SSH session zero.' }
+if ($TestDirectory -ine 'C:\VoiceBridge-test\front') { throw 'Expected the dedicated VoiceBridge test directory.' }
+if (Get-Process -Name nvda,nvda_uiAccess,nvda_noUIAccess,VoiceBridge -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq 0 }) { throw 'An NVDA or VoiceBridge process already exists in the SSH session.' }
 Set-Location -LiteralPath $TestDirectory
 @'
 [log]
@@ -8,6 +11,7 @@ level=debug
 text=1
 [nvda]
 processNames=nvda.exe;nvda_uiAccess.exe;nvda_noUIAccess.exe;VB-FAKE-NVDA.exe;VoiceBridge.exe
+startsAtSignIn=no
 '@ | Set-Content -LiteralPath VoiceBridge.ini -Encoding ASCII
 $children = [Collections.Generic.List[Diagnostics.Process]]::new()
 
@@ -37,8 +41,9 @@ function Read-BridgeLog {
     if (Test-Path bridge.log) { Get-Content -Encoding UTF8 -LiteralPath bridge.log }
 }
 
-function Wait-Serving($Started, [int] $Previous = 0, [string] $Image = 'VoiceBridge.exe') {
-    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+function Wait-Serving($Started, [int] $Previous = 0, [string] $Image = 'VoiceBridge.exe', [int] $Timeout = 4000) {
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    while ($deadline.ElapsedMilliseconds -lt $Timeout) {
         $lines = @(Read-BridgeLog | Select-String -Pattern ' (\d+) server info Serving (NvdaCtlr\..+)$')
         if ($lines.Count) {
             $match = $lines[-1].Matches[0]
@@ -110,9 +115,91 @@ function Assert-StandAside([string] $Reason) {
     }
 }
 
+function Assert-NoService($Supervisor) {
+    if ($Supervisor.HasExited -or (Read-BridgeLog | Select-String -Pattern ' server info Serving ' -Quiet)) {
+        throw 'The supervisor exited or started serving during the sign-in wait.'
+    }
+    Finish-Test (Start-Test lifecycle 'no-nvda-window') 'lifecycle.txt'
+}
+
+function Check-SignInWait {
+    $originalIni = @(Get-Content -LiteralPath VoiceBridge.ini)
+    try {
+        foreach ($modeName in 'nvda-early','nvda-past-deadline','expired','disabled','ssh-logon') {
+            Reset-Log
+            $override = if ($modeName -eq 'disabled') { 'no' } else { 'yes' }
+            $bridge = if ($modeName -eq 'ssh-logon') { 'VoiceBridge' } else { 'signin-bridge' }
+            $seconds = if ($modeName -eq 'ssh-logon') { 1 } else { 4 }
+            ($originalIni -replace '^startsAtSignIn=.*$', "startsAtSignIn=$override") + "signInWaitSeconds=$seconds" |
+                Set-Content -LiteralPath VoiceBridge.ini -Encoding ASCII
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            $supervisor = Start-Test $bridge
+            if ($override -eq 'yes' -and $modeName -ne 'ssh-logon') {
+                Wait-Result 'bridge.log' 'supervisor info Sign-in wait: waiting up to 4000 ms for NVDA \(logon time unavailable\)'
+                Assert-NoService $supervisor
+            }
+            if ($modeName -like 'nvda-*') {
+                Remove-Item -LiteralPath 'fake.txt' -ErrorAction SilentlyContinue
+                $fixture = Start-Test vb-fake-nvda
+                Wait-Result 'fake.txt' 'fixture ready'
+                Wait-Result 'bridge.log' "Waiting for NVDA process $($fixture.Id)$"
+                if ($timer.ElapsedMilliseconds -ge 4000) { throw 'Fake NVDA did not appear inside the sign-in wait.' }
+                if ($modeName -eq 'nvda-past-deadline') {
+                    Start-Sleep -Milliseconds ([Math]::Max(0, 4500 - $timer.ElapsedMilliseconds))
+                }
+                Assert-NoService $supervisor
+                if ($fixture.HasExited) { throw 'Fake NVDA exited before the test stopped it.' }
+                End-Fixture $fixture
+                $restart = [Diagnostics.Stopwatch]::StartNew()
+                $server = Wait-Serving $supervisor 0 'signin-bridge.exe' 2000
+                if ($modeName -eq 'nvda-early') {
+                    if ($timer.ElapsedMilliseconds -ge 3900) { throw 'A completed NVDA run did not end the wait early.' }
+                    'Sign-in wait ended early. VoiceBridge served {0:F2} ms after fake NVDA quit.' -f $restart.Elapsed.TotalMilliseconds
+                } else {
+                    'Sign-in wait detected fake NVDA, stood aside past the deadline, and served {0:F2} ms after it quit.' -f $restart.Elapsed.TotalMilliseconds
+                }
+            } else {
+                $server = Wait-Serving $supervisor 0 "$bridge.exe" 6000
+                $elapsed = $timer.Elapsed.TotalMilliseconds
+                if ($modeName -eq 'expired') {
+                    if ($elapsed -lt 3900) { throw "Sign-in wait expired early at $elapsed ms." }
+                    'Sign-in wait served after {0:F2} ms with no NVDA.' -f $elapsed
+                } elseif ($modeName -eq 'disabled') {
+                    if ($elapsed -gt 1500) { throw "Opting out of the sign-in wait took $elapsed ms." }
+                    'Disabling the sign-in wait served after {0:F2} ms.' -f $elapsed
+                } else {
+                    $log = @(Read-BridgeLog)
+                    if ($log | Select-String -Pattern 'Sign-in wait: the configured wait since sign-in has elapsed' -Quiet) {
+                        'The production logon lookup recognized the existing SSH logon and served after {0:F2} ms.' -f $elapsed
+                    } elseif ($log | Select-String -Pattern 'Sign-in wait: waiting up to 1000 ms for NVDA \(logon time unavailable\)' -Quiet) {
+                        if ($elapsed -lt 900) { throw 'The production logon lookup fallback expired early.' }
+                        'Windows did not supply the SSH logon time. The production fallback served after {0:F2} ms.' -f $elapsed
+                    } else {
+                        throw 'Unexpected production logon lookup decision for the existing SSH logon.'
+                    }
+                }
+            }
+            $fixtureMode = if ($modeName -eq 'ssh-logon') { 'serving' } else { 'signin-serving' }
+            Finish-Test (Start-Test lifecycle "$fixtureMode $($server.Id)") 'lifecycle.txt'
+            Assert-Exit (Start-Test $bridge '--stop') 0
+            Assert-Exit $supervisor 0
+            Assert-Exit $server 0
+            $log = @(Read-BridgeLog)
+            if (@($log | Select-String -Pattern ' supervisor info Sign-in wait: ').Count -ne 1 -or
+                @($log | Select-String -Pattern ' server info Serving ').Count -ne 1) {
+                throw 'Expected exactly one sign-in decision at info level and one serving line.'
+            }
+        }
+    } finally {
+        $originalIni | Set-Content -LiteralPath VoiceBridge.ini -Encoding ASCII
+    }
+}
+
 try {
+    Finish-Test (Start-Test lifecycle 'test-desktop') 'lifecycle.txt'
     $guard = Start-Test VoiceBridge '--serve'
     $server = Wait-Serving $guard
+    Finish-Test (Start-Test lifecycle "serving $($server.Id)") 'lifecycle.txt'
     Finish-Test (Start-Test stock) 'stock.txt'
     Check-LogTail @('Speak: Stock plain', ('Speak: Caf' + [char]0xE9 + ' d' + [char]0xE9 + 'j' + [char]0xE0 + ' vu ' + [char]0x4E2D + [char]0x6587), ('Speak: ' + ('x' * 4000)), 'Speak: <b>5 < 6 & 7', 'Cancel') '(Speak: .*|Cancel)$'
     if (@(Select-String -Path bridge.log -Pattern 'Speak: ').Count -ne 4) { throw 'Expected exactly four logged stock phrases' }
@@ -120,6 +207,9 @@ try {
     Finish-Test (Start-Test prism-client) 'prism.txt'
     Check-LogTail @('Cancel', 'Speak: PRISM plain', 'IsSpeaking: false', 'Cancel') '(Speak: .*|IsSpeaking: .*|Cancel)$'
     'PRISM speech, cancel and isSpeaking all reached the silent speaker.'
+    Finish-Test (Start-Test tolk-client) 'tolk.txt'
+    Check-LogTail @('Speak: Tolk plain', 'Cancel') '(Speak: .*|Cancel)$'
+    'Tolk speech and cancel reached the silent speaker.'
     if ($Mode -eq 'rpc') {
         Assert-Exit (Start-Test VoiceBridge '--stop') 0
         Assert-Exit $server 0
@@ -202,15 +292,32 @@ try {
     if (!$supervisor.HasExited -or !$server.HasExited) { throw '--stop returned before both roles exited' }
     '--stop waited for both roles and returned in {0:F2} ms.' -f $stopMs
 
-    foreach ($modeName in 'normal-start','ease-start','restart') {
+    foreach ($modeName in 'normal-start','restart') {
         Reset-Log
         $supervisor = Start-Test VoiceBridge
         $server = Wait-Serving $supervisor
         Finish-Test (Start-Test lifecycle "$modeName $($server.Id)") 'lifecycle.txt'
-        [void] (Wait-Serving $supervisor $server.Id)
+        Assert-Exit $server 0
+        $server = Wait-Serving $supervisor $server.Id
         Assert-Exit (Start-Test VoiceBridge '--stop') 0
         Assert-Exit $supervisor 0
+        Assert-Exit $server 0
     }
+    Reset-Log
+    Finish-Test (Start-Test lifecycle 'missed-window-start') 'lifecycle.txt'
+    Reset-Log
+    $supervisor = Start-Test VoiceBridge
+    $server = Wait-Serving $supervisor
+    foreach ($option in '--ease-of-access','--check-running') {
+        Finish-Test (Start-Test vb-fake-nvda "$option $($server.Id)") 'fake.txt'
+        Finish-Test (Start-Test lifecycle "serving $($server.Id)") 'lifecycle.txt'
+        if ($supervisor.HasExited -or $server.HasExited) { throw "The $option fixture stopped VoiceBridge." }
+        "The same supervisor and worker kept serving after $option returned."
+    }
+    Assert-Exit (Start-Test VoiceBridge '--stop') 0
+    Assert-Exit $supervisor 0
+    Assert-Exit $server 0
+    Check-SignInWait
 
     Reset-Log
     $supervisor = Start-Test VoiceBridge
@@ -275,12 +382,20 @@ try {
     $server.Refresh()
     $supervisorCpu = $supervisor.TotalProcessorTime
     $serverCpu = $server.TotalProcessorTime
+    Finish-Test (Start-Test lifecycle "serving $($server.Id)") 'lifecycle.txt'
     $idleTimer = [Diagnostics.Stopwatch]::StartNew()
     Start-Sleep -Seconds 60
     $idleSeconds = $idleTimer.Elapsed.TotalSeconds
     $supervisor.Refresh()
     $server.Refresh()
     if ($server.HasExited -or $supervisor.HasExited) { throw 'Bridge exited during idle measurement' }
+    Finish-Test (Start-Test lifecycle "serving $($server.Id)") 'lifecycle.txt'
+    $idleLog = @(Read-BridgeLog)
+    if (@($idleLog | Select-String -Pattern ' server info Serving ').Count -ne 1 -or
+        ($idleLog | Select-String -Pattern 'Standing aside|Waiting for NVDA|Retrying server|Server exited' -Quiet)) {
+        throw 'VoiceBridge stood aside or restarted during the steady-state check.'
+    }
+    'The same worker kept the exact hidden NVDA window and answered RPC throughout the idle trial. The log contains one serving line.'
     $serverMs = ($server.TotalProcessorTime - $serverCpu).TotalMilliseconds
     $supervisorMs = ($supervisor.TotalProcessorTime - $supervisorCpu).TotalMilliseconds
     'Idle for {0:F2} s. CPU time {1:F2} ms total ({2:F2} supervisor, {3:F2} server).' -f $idleSeconds, ($serverMs + $supervisorMs), $supervisorMs, $serverMs
@@ -317,9 +432,9 @@ try {
     }
     # The supervisor creates an untracked server process. On any failed test,
     # clean up only exact executables in the owned SSH test directory.
-    foreach ($proc in @(Get-Process VoiceBridge,vb-fake-nvda -ErrorAction SilentlyContinue)) {
-        if ($proc.SessionId -eq 0 -and $proc.Path -and
-            (Split-Path -Parent $proc.Path) -eq $TestDirectory) {
+    foreach ($proc in @(Get-Process VoiceBridge,stuck-bridge,signin-bridge,vb-fake-nvda,lifecycle -ErrorAction SilentlyContinue)) {
+        if ($proc.SessionId -eq 0 -and $proc.Path -eq (Join-Path $TestDirectory ($proc.ProcessName + '.exe'))) {
+            [void] $proc.Handle
             $proc.Kill()
             [void] $proc.WaitForExit(5000)
         }
